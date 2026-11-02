@@ -176,6 +176,19 @@ claude mcp add --transport http redpilot http://127.0.0.1:39217/mcp \
 
 ## 🚀 快速开始
 
+### 下载安装
+
+在 [Releases](https://github.com/willsshan/redpilot/releases) 页面下载最新版本：
+
+| 系统 | 安装包 |
+|---|---|
+| macOS 11+（Apple 芯片与 Intel 通用） | `RedPilot_x.y.z_universal.dmg` |
+| Windows 10 / 11 | `RedPilot_x.y.z_x64-setup.exe`（推荐）或 `.msi` |
+
+安装包暂未签名：
+- **macOS**：首次打开时右键点击应用 →“打开”；如果提示“已损坏”，在终端执行 `xattr -cr /Applications/RedPilot.app`
+- **Windows**：出现 SmartScreen 提示时，点“更多信息”→“仍要运行”
+
 ### 前置条件
 - Redmine 管理员已在“管理 → 配置 → API”中启用 **REST web service**
 - 你的 Redmine API Key（在“我的账号”页面右侧查看）
@@ -249,8 +262,9 @@ redpilot/
 - [x] 同步、AI 分析分类、合并规划、一键回派、批量回派、追问
 - [x] 相似历史知识库、计时与工时、日报 / 周报
 - [x] MCP 服务（HTTP + stdio）
-- [ ] 多服务器 / 多账号
 - [x] 看板视图、⌘K 命令面板、回派附件、动态与到期提醒、开机自启（v0.2）
+- [x] 项目总览：版本进度、成员负载、多选一键转派（v0.2）
+- [ ] 多服务器 / 多账号
 - [ ] 自动更新、安装包签名
 
 完整清单见 [docs/产品功能清单.md](docs/产品功能清单.md)。
@@ -262,7 +276,13 @@ cargo test -p redpilot-core   # 核心逻辑单元测试
 npm run typecheck             # 前端类型检查
 ```
 
-每次推送到 main 时，CI 会在 macOS 和 Windows 上分别构建并运行测试。
+每次推送到 main 或提交 PR 时，CI 会在 Windows 上运行测试并打出安装包（在 Actions 页面的 Artifacts 中下载）。
+
+## 🤝 参与贡献
+
+欢迎提 [Issue](https://github.com/willsshan/redpilot/issues) 反馈问题或建议，也欢迎提交 PR。提交前请确认 `cargo test -p redpilot-core` 和 `npm run typecheck` 通过。
+
+反馈问题时请附上 Redmine 版本和操作系统。请勿在 Issue 中粘贴 API Key 或内部系统地址、截图。
 
 ## 👤 作者
 
