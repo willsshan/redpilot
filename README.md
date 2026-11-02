@@ -11,7 +11,7 @@
 ![Rust](https://img.shields.io/badge/Rust-Tauri%202-orange?logo=rust)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
-![MCP](https://img.shields.io/badge/MCP-21%20tools-8e4ec6)
+![MCP](https://img.shields.io/badge/MCP-25%20tools-8e4ec6)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -42,6 +42,16 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 - 描述和沟通记录中的**图片直接显示**（附件需要登录才能访问，由 RedPilot 带 API Key 下载并缓存），点击可放大
 - 拖动卡片即可修改 Redmine 状态，拖到底部回派区直接回派
 - **⌘K / Ctrl+K 命令面板**：搜索任务、跳转页面、执行同步、分析、规划、日报和周报
+
+### 🧭 项目总览（项目管理员视角）
+- 选择项目查看全部未关闭任务（不限于指派给自己的），自己担任管理角色的项目排在前面
+- 进度：未指派、逾期、14 天未更新、本周新增与关闭；各版本完成进度；近 8 周新增与关闭趋势
+- 成员负载：每人负责多少任务、其中逾期多少，点击即可筛选
+- **多选后一键转派**：每个任务按类别默认负责人、相似任务现在由谁负责、当前负载推荐负责人，也可以让 AI 分配；可逐个调整或全部指派给一个人，附带统一说明
+
+<p align="center">
+  <img src="docs/screenshots/assign.png" width="760" alt="批量转派" />
+</p>
 
 ### 🧠 AI 分析与分类
 - 关键词规则离线预分类，不消耗 token
@@ -155,7 +165,8 @@ claude mcp add --transport http redpilot http://127.0.0.1:39217/mcp \
 | 类型 | 工具 |
 |---|---|
 | 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_recent_changes` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `list_assignees` · `draft_resolution_note` · `set_classification` · `work_report` |
-| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
+| 项目总览 | `list_my_projects` · `get_project_overview` · `suggest_assignments` |
+| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `bulk_assign` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
 
 写操作会直接修改 Redmine 并通知相关人员，需要在设置中手动开启“允许外部 AI 执行写操作”。通过 MCP 上传附件时，隐藏目录和 RedPilot 数据目录中的文件会被拒绝。
 
