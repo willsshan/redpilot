@@ -1,0 +1,230 @@
+@import "tailwindcss";
+
+/* ---------- 设计令牌：亮色 ---------- */
+:root {
+  --canvas: #f7f7f8;
+  --panel: #ffffff;
+  --sunken: #f1f1f3;
+  --hover: #ececef;
+  --line: #e4e4e8;
+  --line-strong: #d4d4da;
+  --ink: #18181b;
+  --ink-2: #52525b;
+  --ink-3: #8b8b94;
+  --accent: #e5484d;
+  --accent-hover: #d93d42;
+  --accent-soft: #feebec;
+  --accent-ink: #c62a2f;
+  --ok: #18794e;
+  --ok-soft: #e6f6eb;
+  --warn: #ad5700;
+  --warn-soft: #fff1de;
+  --info: #0b68cb;
+  --info-soft: #e6f1fe;
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 4px 16px rgb(0 0 0 / 0.06);
+  --shadow-lg: 0 8px 40px rgb(0 0 0 / 0.16), 0 2px 6px rgb(0 0 0 / 0.06);
+  color-scheme: light;
+}
+
+/* ---------- 设计令牌：暗色（跟随系统） ---------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #111113;
+    --panel: #18181b;
+    --sunken: #141416;
+    --hover: #232327;
+    --line: #2a2a2f;
+    --line-strong: #3a3a40;
+    --ink: #ededef;
+    --ink-2: #b4b4bb;
+    --ink-3: #7c7c85;
+    --accent: #ec5d5e;
+    --accent-hover: #f07071;
+    --accent-soft: #3b1219;
+    --accent-ink: #ff9592;
+    --ok: #3dd68c;
+    --ok-soft: #132d21;
+    --warn: #ffc53d;
+    --warn-soft: #302008;
+    --info: #70b8ff;
+    --info-soft: #0d2847;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 4px 16px rgb(0 0 0 / 0.3);
+    --shadow-lg: 0 8px 40px rgb(0 0 0 / 0.5), 0 2px 6px rgb(0 0 0 / 0.3);
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-sunken: var(--sunken);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-ink: var(--accent-ink);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --shadow-card: var(--shadow);
+  --shadow-pop: var(--shadow-lg);
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
+    "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, "Microsoft YaHei UI", monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+/* 正文类内容允许选择复制 */
+.selectable,
+textarea,
+input {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ink-3) 35%, transparent);
+  border-radius: 10px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--ink-3) 60%, transparent);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+button {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+@keyframes rp-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-in {
+  animation: rp-fade-in 160ms ease-out;
+}
+
+@keyframes rp-shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: calc(200px + 100%) 0;
+  }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--sunken) 0, var(--hover) 50%, var(--sunken) 100%);
+  background-size: 200px 100%;
+  animation: rp-shimmer 1.2s infinite linear;
+  border-radius: 6px;
+}
+
+/* AI 区块的柔和渐变边框 */
+.ai-card {
+  background:
+    linear-gradient(var(--panel), var(--panel)) padding-box,
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 45%, transparent), color-mix(in srgb, #8e4ec6 45%, transparent))
+      border-box;
+  border: 1px solid transparent;
+}
+
+.prose-rp h1,
+.prose-rp h2,
+.prose-rp h3 {
+  font-weight: 600;
+  margin: 0.9em 0 0.4em;
+}
+.prose-rp h1 {
+  font-size: 1.15em;
+}
+.prose-rp h2 {
+  font-size: 1.08em;
+}
+.prose-rp h3 {
+  font-size: 1em;
+}
+.prose-rp p {
+  margin: 0.35em 0;
+}
+.prose-rp ul,
+.prose-rp ol {
+  margin: 0.35em 0;
+  padding-left: 1.4em;
+}
+.prose-rp ul {
+  list-style: disc;
+}
+.prose-rp ol {
+  list-style: decimal;
+}
+.prose-rp li {
+  margin: 0.15em 0;
+}
+.prose-rp code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--sunken);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.prose-rp pre {
+  font-family: var(--font-mono);
+  background: var(--sunken);
+  padding: 0.7em 0.9em;
+  border-radius: 8px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  font-size: 12.5px;
+}
+.prose-rp strong {
+  font-weight: 600;
+}
