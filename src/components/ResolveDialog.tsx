@@ -6,6 +6,7 @@ import { useToast } from "../lib/toast";
 import { modKey, noteTemplate } from "../lib/format";
 import { clearTimer, msToHours, timerElapsed } from "../lib/timer";
 import { Avatar, Button, Field, Input, Modal, Select, Switch, Textarea } from "./ui";
+import { AttachmentBar, DropOverlay, imageRef, useFileDrop, useStagedFiles } from "./Attachments";
 
 /** 处理完成 → 写处置说明 → 指派回提出人。支持单个或一组合并处理的任务。 */
 export function ResolveDialog({
@@ -33,6 +34,8 @@ export function ResolveDialog({
   const [hours, setHours] = useState("");
   const [activityId, setActivityId] = useState<number | null>(null);
   const [privateNotes, setPrivateNotes] = useState(false);
+  const att = useStagedFiles();
+  const drop = useFileDrop((fs) => void att.add(fs));
 
   const batch = issues.length > 1;
   const ids = useMemo(() => issues.map((i) => i.id), [issues]);
@@ -46,6 +49,7 @@ export function ResolveDialog({
     setDoneRatio(config.workflow.setDoneRatio);
     setActivityId(config.workflow.defaultActivityId ?? null);
     setPrivateNotes(false);
+    att.reset();
     const h = batch ? null : msToHours(timerElapsed(issues[0]?.id ?? 0));
     setHours(h ? String(h) : "");
     api.statuses().then(setStatuses).catch(() => setStatuses([]));
@@ -72,6 +76,10 @@ export function ResolveDialog({
       toast.show({ tone: "warn", title: "请先填写处置说明" });
       return;
     }
+    if (att.busy > 0) {
+      toast.show({ tone: "warn", title: "附件还在添加中，请稍候" });
+      return;
+    }
     const h = parseFloat(hours);
     const base = {
       notes,
@@ -81,6 +89,7 @@ export function ResolveDialog({
       spentHours: Number.isFinite(h) && h > 0 ? h : null,
       activityId,
       privateNotes,
+      attachments: att.files.map((f) => f.path),
     };
     const reqs: ResolveRequest[] = issues.map((i) => ({ ...base, issueId: i.id }));
     onClose();
@@ -110,7 +119,9 @@ export function ResolveDialog({
       toast.show({
         tone: out.warnings.length ? "warn" : "success",
         title: `#${req.issueId} 已回派${out.assignedTo ? `给 ${out.assignedTo}` : ""}`,
-        body: [out.status ? `状态：${out.status}` : "", ...out.warnings].filter(Boolean).join("\n"),
+        body: [out.status ? `状态：${out.status}` : "", out.attached.length ? `附件：${out.attached.join("、")}` : "", ...out.warnings]
+          .filter(Boolean)
+          .join("\n"),
       });
     } catch (e) {
       const code = errorCode(e);
@@ -164,9 +175,17 @@ export function ResolveDialog({
       }
     >
       <div className="flex min-h-[460px]">
-        <div className="flex-1 space-y-4 p-5">
+        <div className="relative flex-1 space-y-4 p-5" {...drop.props}>
+          <DropOverlay show={drop.over} />
           <Field label="处理要点" hint="写几句关键信息即可，例如：原因是缓存未刷新；已清理缓存并增加失效机制；需要用户重新登录验证">
-            <Textarea rows={3} value={points} onChange={(e) => setPoints(e.target.value)} placeholder="简单写下原因和处理方法，AI 会扩写成规范的处置说明…" autoFocus />
+            <Textarea
+              rows={3}
+              value={points}
+              onChange={(e) => setPoints(e.target.value)}
+              onPaste={(e) => void att.handlePaste(e)}
+              placeholder="简单写下原因和处理方法，AI 会扩写成规范的处置说明…"
+              autoFocus
+            />
           </Field>
           <div className="flex gap-2">
             <Button variant="ai" icon={<Sparkles className="size-3.5" />} loading={drafting} onClick={() => void draft()}>
@@ -188,8 +207,24 @@ export function ResolveDialog({
               </span>
             }
           >
-            <Textarea rows={13} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="可直接编辑，也可以先用 AI 生成" />
+            <Textarea
+              rows={12}
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              onPaste={(e) => {
+                const pos = e.currentTarget.selectionStart;
+                // 粘贴截图：添加为附件，并在光标处插入图片引用
+                const staged = att.handlePaste(e);
+                if (!staged) return;
+                void staged.then((fs) => {
+                  const refs = fs.filter((f) => f.contentType?.startsWith("image/")).map((f) => imageRef(f.filename, textFormat));
+                  if (refs.length) setNotes((n) => `${n.slice(0, pos)}${refs.join("\n")}\n${n.slice(pos)}`);
+                });
+              }}
+              placeholder="可直接编辑，也可以先用 AI 生成；粘贴截图会自动作为附件插入"
+            />
           </Field>
+          <AttachmentBar att={att} hint={batch ? "附件会分别上传到每个任务；可直接粘贴截图或拖入文件" : undefined} />
         </div>
 
         <div className="w-[280px] shrink-0 space-y-4 border-l border-line bg-sunken/40 p-5">

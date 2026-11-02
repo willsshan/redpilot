@@ -1,24 +1,40 @@
 import { useEffect, useState } from "react";
 import clsx from "clsx";
-import { AlertTriangle, CheckCircle2, Clock, Copy, FileText, Flame, Inbox, Mail, Sparkles } from "lucide-react";
-import { api, errorText, type ResolutionRecord } from "../lib/api";
+import { AlertTriangle, ArrowRightLeft, CalendarClock, CheckCircle2, Clock, Copy, FileText, Flame, Inbox, Mail, MessageSquareText, Signal, Sparkles } from "lucide-react";
+import { api, errorText, type IssueChange, type ResolutionRecord } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
-import { categoryColor, dateTime, isMac } from "../lib/format";
+import { categoryColor, dateTime, isMac, relativeTime } from "../lib/format";
 import { Badge, Button, Card, SectionTitle } from "../components/ui";
 import { Markdown } from "../components/Markdown";
 import type { ReactNode } from "react";
 
 export function DashboardPage() {
-  const { stats, rev } = useApp();
+  const { stats, rev, intent, clearIntent, setPage, setFocusIssue } = useApp();
   const toast = useToast();
   const [report, setReport] = useState("");
   const [reportDays, setReportDays] = useState<number | null>(null);
   const [records, setRecords] = useState<ResolutionRecord[]>([]);
+  const [changes, setChanges] = useState<IssueChange[]>([]);
+  const [tab, setTab] = useState<"resolved" | "changes">("resolved");
 
   useEffect(() => {
     api.recentResolutions(30).then(setRecords).catch(() => {});
+    api.recentChanges(50).then(setChanges).catch(() => {});
   }, [rev]);
+
+  useEffect(() => {
+    if (intent?.type === "report") {
+      clearIntent();
+      void gen(intent.days);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intent]);
+
+  function openIssue(id: number) {
+    setFocusIssue(id);
+    setPage("inbox");
+  }
 
   async function gen(days: number) {
     setReportDays(days);
@@ -60,7 +76,19 @@ export function DashboardPage() {
               <Bars data={(s?.byProject ?? []).slice(0, 8)} color={() => "var(--info)"} />
             </Card>
             <Card className="p-4">
-              <SectionTitle right={<span className="text-[11.5px] text-ink-3">30 天 AI 用量 {((s?.aiTokens30d ?? 0) / 1000).toFixed(1)}k tokens</span>}>近 14 天回派</SectionTitle>
+              <SectionTitle
+                right={
+                  <span
+                    className="text-[11.5px] text-ink-3"
+                    title={`输入 ${(s?.aiPromptTokens30d ?? 0).toLocaleString()} · 输出 ${(s?.aiCompletionTokens30d ?? 0).toLocaleString()} tokens，按设置中的单价估算`}
+                  >
+                    30 天 AI {((s?.aiTokens30d ?? 0) / 1000).toFixed(1)}k tokens
+                    {s && s.aiCost30d > 0 ? ` · 约 ${s.aiCurrency}${s.aiCost30d < 0.01 ? "0.01" : s.aiCost30d.toFixed(2)}` : ""}
+                  </span>
+                }
+              >
+                近 14 天回派
+              </SectionTitle>
               <div className="flex h-[150px] items-end gap-1.5 pt-2">
                 {(s?.dailyResolved ?? []).map(([d, n]) => (
                   <div key={d} className="group flex flex-1 flex-col items-center gap-1">
@@ -109,7 +137,43 @@ export function DashboardPage() {
             </Card>
 
             <Card className="flex flex-col">
-              <div className="border-b border-line px-4 py-3 text-[13px] font-semibold">最近回派 · 30 天 {records.length}</div>
+              <div className="flex items-center gap-1 border-b border-line px-3 py-2">
+                {(
+                  [
+                    ["resolved", `最近回派 ${records.length}`],
+                    ["changes", `他人动态 ${changes.length}`],
+                  ] as const
+                ).map(([k, label]) => (
+                  <button
+                    key={k}
+                    onClick={() => setTab(k)}
+                    className={clsx("rounded-md px-2.5 py-1 text-[13px]", tab === k ? "bg-sunken font-semibold text-ink" : "text-ink-3 hover:text-ink")}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {tab === "changes" ? (
+                <ul className="max-h-[420px] flex-1 divide-y divide-line overflow-y-auto">
+                  {changes.length === 0 && <li className="p-4 text-[12.5px] text-ink-3">同步时会记录提出人回复、任务被转回、优先级和截止日期调整等动态</li>}
+                  {changes.map((c, i) => {
+                    const Icon = c.kind === "reply" ? MessageSquareText : c.kind === "assigned" ? ArrowRightLeft : c.kind === "due" ? CalendarClock : c.kind === "priority" ? Signal : CheckCircle2;
+                    return (
+                      <li key={i} onClick={() => openIssue(c.issueId)} className="flex gap-2.5 px-4 py-2.5 hover:bg-hover">
+                        <Icon className={clsx("mt-0.5 size-3.5 shrink-0", c.important ? "text-accent" : "text-ink-3")} />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 text-[11.5px] text-ink-3">
+                            <span className="font-mono">#{c.issueId}</span>
+                            <span className="truncate">{c.subject}</span>
+                            <span className="ml-auto shrink-0">{relativeTime(c.createdOn)}</span>
+                          </div>
+                          <div className="line-clamp-2 text-[12.5px] text-ink">{c.summary}</div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
               <ul className="max-h-[420px] flex-1 divide-y divide-line overflow-y-auto">
                 {records.length === 0 && <li className="p-4 text-[12.5px] text-ink-3">暂无记录</li>}
                 {records.map((r, i) => (
@@ -125,6 +189,7 @@ export function DashboardPage() {
                   </li>
                 ))}
               </ul>
+              )}
             </Card>
           </div>
         </div>

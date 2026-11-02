@@ -1,4 +1,5 @@
 import { Sidebar } from "./components/Sidebar";
+import { CommandPalette } from "./components/CommandPalette";
 import { AppProvider, useApp } from "./lib/store";
 import { ToastProvider } from "./lib/toast";
 import { DashboardPage } from "./pages/Dashboard";
@@ -17,6 +18,7 @@ function Shell() {
         {page === "dashboard" && <DashboardPage />}
         {page === "settings" && <SettingsPage />}
       </main>
+      <CommandPalette />
     </div>
   );
 }

@@ -1,0 +1,46 @@
+name: Release
+
+# 推送 v* 标签时构建 macOS（通用二进制）与 Windows 安装包，生成草稿 Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: windows-latest
+            args: ""
+            targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: RedPilot ${{ github.ref_name }}
+          releaseBody: |
+            安装包见下方附件：macOS 为 .dmg（Apple 芯片与 Intel 通用），Windows 为 .msi / -setup.exe。
+            安装包暂未签名：macOS 首次打开请右键 →“打开”，或在“系统设置 → 隐私与安全性”中允许；Windows 如出现 SmartScreen 提示，选择“仍要运行”。
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

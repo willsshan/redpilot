@@ -175,6 +175,8 @@ pub struct IssueView {
     pub in_inbox: bool,
     pub unread: bool,
     pub overdue: bool,
+    /// 上次查看之后的最新动态（如“张三 回复：…”），查看后清除
+    pub change_hint: Option<String>,
     pub analysis: Analysis,
 }
 
@@ -239,6 +241,26 @@ pub struct SyncReport {
     pub updated_ids: Vec<u64>,
     pub removed: usize,
     pub finished_at: String,
+    /// 他人在 Redmine 上做的变更：回复、调整优先级/截止日期/状态、转回给我
+    pub changes: Vec<IssueChange>,
+    /// 今天或明天到期、且今天还没提醒过的任务
+    pub due_soon: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueChange {
+    pub issue_id: u64,
+    pub subject: String,
+    /// reply | priority | due | status | assigned
+    pub kind: String,
+    pub actor: String,
+    /// 变更人是否为提出人
+    pub by_author: bool,
+    pub summary: String,
+    /// 是否值得打扰（提出人回复、转回给我、调为高优先级）
+    pub important: bool,
+    pub created_on: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -298,6 +320,9 @@ pub struct ResolveRequest {
     pub activity_id: Option<u64>,
     #[serde(default)]
     pub private_notes: bool,
+    /// 要上传的附件（本地文件路径），每个任务单独上传一份
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -311,8 +336,20 @@ pub struct ResolveOutcome {
     pub ok: bool,
     pub assigned_to: Option<String>,
     pub status: Option<String>,
+    /// 已上传的附件文件名
+    pub attached: Vec<String>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+}
+
+/// 已暂存、等待随回派上传的附件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedFile {
+    pub path: String,
+    pub filename: String,
+    pub size: u64,
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -332,6 +369,11 @@ pub struct Stats {
     /// 最近 14 天每天回派数量（日期, 数量）
     pub daily_resolved: Vec<(String, usize)>,
     pub ai_tokens_30d: u64,
+    pub ai_prompt_tokens_30d: u64,
+    pub ai_completion_tokens_30d: u64,
+    /// 按设置中的单价估算的 30 天 AI 费用
+    pub ai_cost_30d: f64,
+    pub ai_currency: String,
     pub last_sync_at: Option<String>,
 }
 

@@ -35,6 +35,15 @@ pub struct IssueUpdate {
     pub status_id: Option<u64>,
     pub assigned_to_id: Option<u64>,
     pub done_ratio: Option<u32>,
+    pub uploads: Vec<UploadRef>,
+}
+
+/// `/uploads.json` 返回的令牌，随任务更新一起提交后附件才会挂到任务上（令牌只能用一次）
+#[derive(Debug, Clone)]
+pub struct UploadRef {
+    pub token: String,
+    pub filename: String,
+    pub content_type: Option<String>,
 }
 
 impl RedmineClient {
@@ -179,9 +188,60 @@ impl RedmineClient {
         if let Some(d) = u.done_ratio {
             issue.insert("done_ratio".into(), json!(d));
         }
+        if !u.uploads.is_empty() {
+            let ups: Vec<Value> = u
+                .uploads
+                .iter()
+                .map(|x| {
+                    let mut o = json!({ "token": x.token, "filename": x.filename });
+                    if let Some(ct) = &x.content_type {
+                        o["content_type"] = json!(ct);
+                    }
+                    o
+                })
+                .collect();
+            issue.insert("uploads".into(), json!(ups));
+        }
         self.request(Method::PUT, &format!("/issues/{id}.json"), &[], Some(json!({ "issue": issue })))
             .await?;
         Ok(())
+    }
+
+    /// 上传文件，返回附件令牌
+    pub async fn upload(&self, bytes: Vec<u8>, filename: &str, content_type: Option<&str>) -> Result<UploadRef> {
+        #[derive(Deserialize)]
+        struct Up {
+            token: String,
+        }
+        #[derive(Deserialize)]
+        struct W {
+            upload: Up,
+        }
+        let resp = self
+            .http
+            .post(format!("{}/uploads.json", self.base))
+            .header("X-Redmine-API-Key", &self.key)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .query(&[("filename", filename)])
+            .timeout(Duration::from_secs(300))
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| anyhow!("上传附件失败: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if status == StatusCode::PAYLOAD_TOO_LARGE || text.contains("size") || text.contains("大小") {
+                return Err(crate::coded("UPLOAD_TOO_LARGE", format!("附件 {filename} 超过 Redmine 允许的大小（管理 → 配置 → 文件 中可调整）")));
+            }
+            return Err(map_error(status, &text));
+        }
+        let w: W = serde_json::from_str(&text).context("Redmine 上传接口返回了无法解析的内容")?;
+        Ok(UploadRef {
+            token: w.upload.token,
+            filename: filename.to_string(),
+            content_type: content_type.map(str::to_string),
+        })
     }
 
     pub async fn create_time_entry(&self, issue_id: u64, hours: f64, activity_id: Option<u64>, comments: &str) -> Result<()> {

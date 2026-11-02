@@ -2,6 +2,16 @@
 
 use crate::config::TextFormat;
 
+/// 在系统提示词后追加用户在设置中填写的团队要求
+pub fn with_extra(system: String, extra: &str) -> String {
+    let extra = extra.trim();
+    if extra.is_empty() {
+        system
+    } else {
+        format!("{system}\n\n团队补充要求（优先遵守，但不能违背上面的输出格式）：\n{extra}")
+    }
+}
+
 pub fn classify_system(categories: &[String]) -> String {
     format!(
         r#"你是资深的软件研发与运维工单分析助手，负责帮工程师快速理解 Redmine 任务。

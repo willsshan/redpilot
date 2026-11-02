@@ -49,6 +49,7 @@ fn brief(v: &IssueView, base_url: &str) -> Value {
         "dueDate": v.due_date,
         "overdue": v.overdue,
         "unread": v.unread,
+        "changeHint": v.change_hint,
         "updatedOn": v.updated_on,
         "category": a.category,
         "module": a.module,
@@ -144,6 +145,9 @@ pub struct ResolveParams {
     /// 同时登记的工时（小时）
     #[serde(default)]
     pub spent_hours: Option<f64>,
+    /// 随处置说明上传的附件：本机文件的绝对路径（如截图、日志）。隐藏目录中的文件不能上传
+    #[serde(default)]
+    pub attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -157,6 +161,26 @@ pub struct BatchResolveParams {
     /// 每个任务登记的工时（小时）
     #[serde(default)]
     pub spent_hours_each: Option<f64>,
+    /// 附件（本机文件绝对路径），会分别上传到每个任务
+    #[serde(default)]
+    pub attachments: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StatusParams {
+    pub issue_id: u64,
+    /// 目标状态 ID，可用 get_workflow_options 查询
+    pub status_id: u64,
+    /// 同时写入的备注（可选）
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[serde(default)]
+pub struct ChangesParams {
+    /// 默认 20
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -354,7 +378,7 @@ impl RedPilotMcp {
         self.svc.draft_note(&p.issue_ids, &p.key_points).await.map_err(err)
     }
 
-    #[tool(description = "【写操作】处理完成并回派：写入处置说明、切换到完成状态、指派回提出人、可同时登记工时。提交前请确保说明内容已经用户确认。")]
+    #[tool(description = "【写操作】处理完成并回派：写入处置说明、切换到完成状态、指派回提出人、可同时登记工时和上传附件。提交前请确保说明内容已经用户确认。")]
     async fn resolve_issue(&self, Parameters(p): Parameters<ResolveParams>) -> ToolResult {
         self.ensure_write()?;
         let req = ResolveRequest {
@@ -366,6 +390,7 @@ impl RedPilotMcp {
             spent_hours: p.spent_hours,
             activity_id: None,
             private_notes: false,
+            attachments: p.attachments.unwrap_or_default(),
         };
         to_json(&self.svc.resolve(&req, "mcp").await.map_err(err)?)
     }
@@ -385,6 +410,7 @@ impl RedPilotMcp {
                 spent_hours: p.spent_hours_each,
                 activity_id: None,
                 private_notes: false,
+                attachments: p.attachments.clone().unwrap_or_default(),
             })
             .collect();
         to_json(&self.svc.batch_resolve(&reqs, "mcp").await)
@@ -400,6 +426,18 @@ impl RedPilotMcp {
     async fn start_progress(&self, Parameters(p): Parameters<IssueIdParams>) -> ToolResult {
         self.ensure_write()?;
         to_json(&self.svc.start_progress(p.issue_id).await.map_err(err)?)
+    }
+
+    #[tool(description = "【写操作】修改任务状态（不改指派），可附带备注。工作流不允许时会返回当前可选的状态。")]
+    async fn update_status(&self, Parameters(p): Parameters<StatusParams>) -> ToolResult {
+        self.ensure_write()?;
+        to_json(&self.svc.change_status(p.issue_id, p.status_id, p.notes).await.map_err(err)?)
+    }
+
+    #[tool(description = "查看最近同步到的他人变更：提出人回复、任务被转回给我、优先级/截止日期/状态被调整。适合回答“有什么新动态”。")]
+    async fn get_recent_changes(&self, Parameters(p): Parameters<ChangesParams>) -> ToolResult {
+        self.prepare();
+        to_json(&self.svc.recent_changes(p.limit.unwrap_or(20).min(100)).map_err(err)?)
     }
 
     #[tool(description = "【写操作】给任务添加一条备注（不改状态和指派）。")]

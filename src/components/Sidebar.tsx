@@ -1,8 +1,8 @@
 import clsx from "clsx";
-import { BarChart3, Inbox, RefreshCw, Settings, Sparkles, Plug } from "lucide-react";
+import { BarChart3, Inbox, RefreshCw, Search, Settings, Sparkles, Plug } from "lucide-react";
 import type { ReactNode } from "react";
 import { useApp, type Page } from "../lib/store";
-import { isMac, relativeTime } from "../lib/format";
+import { isMac, modKey, relativeTime } from "../lib/format";
 import { useEffect, useState } from "react";
 
 export function Sidebar() {
@@ -28,6 +28,15 @@ export function Sidebar() {
           <div className="text-[11.5px] text-ink-3">Redmine 工单助手</div>
         </div>
       </div>
+
+      <button
+        onClick={() => window.dispatchEvent(new Event("redpilot:palette"))}
+        className="mx-2.5 mb-3 flex h-8 items-center gap-2 rounded-lg border border-line bg-panel px-2.5 text-[12.5px] text-ink-3 shadow-[0_1px_1px_rgb(0_0_0/0.03)] hover:text-ink-2"
+      >
+        <Search className="size-3.5" />
+        <span className="flex-1 text-left">搜索或执行命令</span>
+        <span className="text-[11px] tracking-wide">{modKey}K</span>
+      </button>
 
       <nav className="flex flex-col gap-0.5 px-2.5">
         <NavItem icon={<Inbox className="size-4" />} label="收件箱" page="inbox" current={page} onClick={setPage} count={stats?.openTotal} dot={!!stats?.unread} />

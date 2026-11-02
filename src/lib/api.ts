@@ -47,6 +47,8 @@ export interface IssueView {
   inInbox: boolean;
   unread: boolean;
   overdue: boolean;
+  /** 上次查看之后的最新动态 */
+  changeHint?: string | null;
   analysis: Analysis;
 }
 
@@ -114,12 +116,25 @@ export interface IssueFilter {
   limit?: number | null;
 }
 
+export interface IssueChange {
+  issueId: number;
+  subject: string;
+  kind: "reply" | "priority" | "due" | "status" | "assigned";
+  actor: string;
+  byAuthor: boolean;
+  summary: string;
+  important: boolean;
+  createdOn: string;
+}
+
 export interface SyncReport {
   total: number;
   newIds: number[];
   updatedIds: number[];
   removed: number;
   finishedAt: string;
+  changes: IssueChange[];
+  dueSoon: number[];
 }
 
 export interface AnalyzeReport {
@@ -154,6 +169,15 @@ export interface ResolveRequest {
   spentHours?: number | null;
   activityId?: number | null;
   privateNotes: boolean;
+  /** 暂存附件的本地路径 */
+  attachments: string[];
+}
+
+export interface StagedFile {
+  path: string;
+  filename: string;
+  size: number;
+  contentType?: string | null;
 }
 
 export interface ResolveOutcome {
@@ -161,6 +185,7 @@ export interface ResolveOutcome {
   ok: boolean;
   assignedTo?: string | null;
   status?: string | null;
+  attached: string[];
   warnings: string[];
   error?: string | null;
 }
@@ -179,6 +204,10 @@ export interface Stats {
   spentHours7d: number;
   dailyResolved: [string, number][];
   aiTokens30d: number;
+  aiPromptTokens30d: number;
+  aiCompletionTokens30d: number;
+  aiCost30d: number;
+  aiCurrency: string;
   lastSyncAt?: string | null;
 }
 
@@ -212,6 +241,8 @@ export interface AppConfig {
     project: string;
     queryId?: number | null;
     notify: boolean;
+    notifyChanges: boolean;
+    notifyDue: boolean;
     autoAnalyze: boolean;
   };
   workflow: {
@@ -232,6 +263,10 @@ export interface AppConfig {
     maskSensitive: boolean;
     excludedProjectIds: number[];
     batchSize: number;
+    priceInput: number;
+    priceOutput: number;
+    currency: string;
+    customPrompts: { classify: string; plan: string; note: string; report: string };
   };
   mcp: { enabled: boolean; port: number; token: string; allowWrite: boolean };
   rules: { category: string; keywords: string[] }[];
@@ -285,6 +320,15 @@ export const api = {
   batchResolve: (reqs: ResolveRequest[]) => invoke<ResolveOutcome[]>("batch_resolve", { reqs }),
   requestMoreInfo: (id: number, question: string) => invoke<ResolveOutcome>("request_more_info", { id, question }),
   startProgress: (id: number) => invoke<ResolveOutcome>("start_progress", { id }),
+  changeStatus: (id: number, statusId: number, notes: string | null = null) =>
+    invoke<ResolveOutcome>("change_status", { id, statusId, notes }),
+  stageAttachment: async (file: Blob, filename: string) =>
+    invoke<StagedFile>("stage_attachment", new Uint8Array(await file.arrayBuffer()), {
+      headers: { "x-filename": encodeURIComponent(filename) },
+    }),
+  recentChanges: (limit = 30) => invoke<IssueChange[]>("recent_changes", { limit }),
+  getAutostart: () => invoke<boolean>("get_autostart"),
+  setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   linkIssues: (id: number, others: number[], relationType = "relates") =>
     invoke<string[]>("link_issues", { id, others, relationType }),
   statuses: () => invoke<NamedId[]>("statuses"),

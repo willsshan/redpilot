@@ -1,7 +1,7 @@
 mod commands;
 
 use commands::AppState;
-use redpilot_core::models::SyncReport;
+use redpilot_core::models::{IssueChange, SyncReport};
 use redpilot_core::{AppEvent, Service};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,12 +45,22 @@ pub fn run() {
         }
     };
 
+    // 开机自启时带 --minimized，只在托盘中运行
+    let minimized = std::env::args().any(|a| a == "--minimized");
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .manage(AppState::new(Arc::clone(&svc)))
         .setup(move |app| {
+            if !minimized {
+                show_main(app.handle());
+            }
             build_tray(app.handle())?;
             forward_events(app.handle().clone(), Arc::clone(&svc));
             spawn_scheduler(Arc::clone(&svc));
@@ -90,6 +100,11 @@ pub fn run() {
             commands::request_more_info,
             commands::start_progress,
             commands::link_issues,
+            commands::change_status,
+            commands::stage_attachment,
+            commands::recent_changes,
+            commands::get_autostart,
+            commands::set_autostart,
             commands::statuses,
             commands::activities,
             commands::stats,
@@ -201,6 +216,52 @@ fn notify_new(app: &AppHandle, svc: &Service, report: &SyncReport) {
         .show();
 }
 
+/// 提出人回复、任务被转回、调为高优先级时通知
+fn notify_changes(app: &AppHandle, svc: &Service, changes: &[IssueChange]) {
+    if !svc.config().sync.notify_changes {
+        return;
+    }
+    let important: Vec<&IssueChange> = changes.iter().filter(|c| c.important).collect();
+    let mut issues: Vec<u64> = important.iter().map(|c| c.issue_id).collect();
+    issues.dedup();
+    let (title, body) = match issues.as_slice() {
+        [] => return,
+        [id] => {
+            let subject = important.first().map(|c| c.subject.as_str()).unwrap_or("");
+            let lines: Vec<&str> = important.iter().map(|c| c.summary.as_str()).collect();
+            (format!("#{id} {subject}"), lines.join("\n"))
+        }
+        _ => {
+            let lines: Vec<String> = important.iter().rev().take(3).map(|c| format!("#{} {}", c.issue_id, c.summary)).collect();
+            (format!("{} 个任务有新动态", issues.len()), lines.join("\n"))
+        }
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+fn notify_due(app: &AppHandle, svc: &Service, report: &SyncReport) {
+    if !svc.config().sync.notify_due || report.due_soon.is_empty() {
+        return;
+    }
+    let today = redpilot_core::local_today();
+    let lines: Vec<String> = report
+        .due_soon
+        .iter()
+        .take(3)
+        .filter_map(|id| svc.db.get_view(*id).ok().flatten())
+        .map(|v| {
+            let when = if v.due_date.as_deref() == Some(today.as_str()) { "今天" } else { "明天" };
+            format!("#{} {}（{when}到期）", v.id, v.subject)
+        })
+        .collect();
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("{} 个任务即将到期", report.due_soon.len()))
+        .body(lines.join("\n"))
+        .show();
+}
+
 fn forward_events(app: AppHandle, svc: Arc<Service>) {
     // 首次使用时第一次同步会把所有任务都当成“新任务”，此时不弹通知
     let mut skip_first_notify = svc.db.kv_get("last_sync_at").ok().flatten().is_none();
@@ -214,7 +275,9 @@ fn forward_events(app: AppHandle, svc: Arc<Service>) {
                         AppEvent::SyncFinished { report } => {
                             if !skip_first_notify {
                                 notify_new(&app, &svc, report);
+                                notify_changes(&app, &svc, &report.changes);
                             }
+                            notify_due(&app, &svc, report);
                             skip_first_notify = false;
                             update_tray(&app);
                         }

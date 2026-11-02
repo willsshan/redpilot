@@ -3,17 +3,24 @@
 use crate::ai::{AiClient, Message, Usage};
 use crate::analysis::{self, Corpus};
 use crate::config::{self, AppConfig, Paths};
-use crate::db::{self, Db};
+use crate::db::{self, Db, PrevIssue};
 use crate::models::*;
 use crate::redmine::{truncate, IssueQuery, IssueUpdate, RedmineClient};
 use crate::secrets::{SecretKind, SecretStore};
 use crate::{coded, mask, prompts};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, Mutex as AsyncMutex, Semaphore};
+
+/// 单个附件大小上限（Redmine 自身的限制通常更小，默认 5MB）
+const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+/// 每次同步最多为多少个有更新的任务拉取沟通记录
+const CHANGE_DETAIL_LIMIT: usize = 30;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -59,6 +66,7 @@ impl Service {
     pub fn open(paths: Paths) -> Result<Arc<Self>> {
         let cfg = config::load(&paths.config_file())?;
         let db = Db::open(&paths.db_file())?;
+        cleanup_staging(&paths.staging_dir());
         let (events, _) = broadcast::channel(64);
         Ok(Arc::new(Self {
             secrets: SecretStore::new(paths.secrets_file()),
@@ -302,7 +310,9 @@ impl Service {
             all.extend(rm.list_issues(&q).await?.into_iter().map(|i| (i.id, i)));
         }
         let issues: Vec<Issue> = all.into_values().collect();
-        let (new_ids, updated_ids, removed) = self.db.apply_sync(&issues)?;
+        let diff = self.db.apply_sync(&issues)?;
+        let new_ids = diff.new_ids;
+        let updated_ids: Vec<u64> = diff.updated.iter().map(|p| p.id).collect();
 
         let changed: HashSet<u64> = new_ids.iter().chain(updated_ids.iter()).copied().collect();
         for is in issues.iter().filter(|i| changed.contains(&i.id)) {
@@ -310,6 +320,11 @@ impl Service {
             self.db
                 .set_rule_category(is.id, analysis::rule_classify(&text, &cfg.rules).as_deref())?;
         }
+        let changes = self.detect_changes(&issues, &diff.updated).await;
+        if !changes.is_empty() {
+            self.db.add_changes(&changes)?;
+        }
+        let due_soon = self.due_soon(&issues)?;
         let finished_at = db::now_rfc3339();
         self.db.kv_set("last_sync_at", &finished_at)?;
 
@@ -327,9 +342,94 @@ impl Service {
             total: issues.len(),
             new_ids,
             updated_ids,
-            removed,
+            removed: diff.removed,
             finished_at,
+            changes,
+            due_soon,
         })
+    }
+
+    /// 为有更新的任务拉取沟通记录，找出别人做的变更（回复、调优先级、改截止日期、转回给我）
+    async fn detect_changes(self: &Arc<Self>, issues: &[Issue], updated: &[PrevIssue]) -> Vec<IssueChange> {
+        if updated.is_empty() {
+            return vec![];
+        }
+        let me = self.me().await.ok().map(|u| u.id);
+        let by_id: HashMap<u64, &Issue> = issues.iter().map(|i| (i.id, i)).collect();
+        let sem = Arc::new(Semaphore::new(4));
+        let mut set = tokio::task::JoinSet::new();
+        for p in updated.iter().take(CHANGE_DETAIL_LIMIT) {
+            let svc = Arc::clone(self);
+            let sem = Arc::clone(&sem);
+            let p = p.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire().await;
+                let r = svc.detail(p.id, false).await;
+                (p, r)
+            });
+        }
+        let mut per_issue: Vec<Vec<IssueChange>> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let Ok((prev, res)) = joined else { continue };
+            let Some(listed) = by_id.get(&prev.id) else { continue };
+            per_issue.push(match res {
+                Ok(detail) => changes_from_journals(&prev, &detail, me),
+                Err(e) => {
+                    tracing::warn!("拉取 #{} 沟通记录失败: {e}", prev.id);
+                    changes_from_fields(&prev, listed)
+                }
+            });
+        }
+        for prev in updated.iter().skip(CHANGE_DETAIL_LIMIT) {
+            if let Some(listed) = by_id.get(&prev.id) {
+                per_issue.push(changes_from_fields(prev, listed));
+            }
+        }
+        let mut out = Vec::new();
+        for changes in per_issue {
+            if let Some(c) = pick_hint(&changes) {
+                if let Err(e) = self.db.set_change_hint(c.issue_id, &c.summary) {
+                    tracing::warn!("保存变更提示失败: {e}");
+                }
+            }
+            out.extend(changes);
+        }
+        out.sort_by(|a, b| a.created_on.cmp(&b.created_on));
+        out
+    }
+
+    /// 今天或明天到期、今天还没提醒过的任务
+    fn due_soon(&self, issues: &[Issue]) -> Result<Vec<u64>> {
+        let today = chrono::Local::now().date_naive();
+        let tomorrow = today + chrono::Duration::days(1);
+        let today_s = today.format("%Y-%m-%d").to_string();
+        let stored = self.db.kv_get("due_notified")?.unwrap_or_default();
+        let mut notified: HashSet<u64> = match stored.split_once(':') {
+            Some((day, ids)) if day == today_s => ids.split(',').filter_map(|x| x.parse().ok()).collect(),
+            _ => HashSet::new(),
+        };
+        let mut due: Vec<u64> = issues
+            .iter()
+            .filter(|i| {
+                i.due_date
+                    .as_deref()
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .is_some_and(|d| d == today || d == tomorrow)
+            })
+            .map(|i| i.id)
+            .filter(|id| !notified.contains(id))
+            .collect();
+        due.sort_unstable();
+        if !due.is_empty() {
+            notified.extend(&due);
+            let ids: Vec<String> = notified.iter().map(u64::to_string).collect();
+            self.db.kv_set("due_notified", &format!("{today_s}:{}", ids.join(",")))?;
+        }
+        Ok(due)
+    }
+
+    pub fn recent_changes(&self, limit: usize) -> Result<Vec<IssueChange>> {
+        self.db.recent_changes(limit)
     }
 
     fn reapply_rules(&self) -> Result<()> {
@@ -475,6 +575,7 @@ impl Service {
                 system.push_str(&format!("- 「{}」→ {}{}\n", truncate(&subject, 40), cat, module.map(|m| format!(" / {m}")).unwrap_or_default()));
             }
         }
+        let system = prompts::with_extra(system, &cfg.ai.custom_prompts.classify);
         let sem = Arc::new(Semaphore::new(3));
         let mut set = tokio::task::JoinSet::new();
         for chunk in issues.chunks(cfg.ai.batch_size.max(1)) {
@@ -594,7 +695,10 @@ impl Service {
         }
         body.push_str(&format!("\n今天是 {}。", chrono::Local::now().format("%Y-%m-%d %A")));
 
-        let msgs = vec![Message::system(prompts::plan_system()), Message::user(self.prep_for_ai(&body))];
+        let msgs = vec![
+            Message::system(prompts::with_extra(prompts::plan_system(), &cfg.ai.custom_prompts.plan)),
+            Message::user(self.prep_for_ai(&body)),
+        ];
         let (v, usage) = ai.chat_json::<Value>(&msgs).await?;
         self.record_usage("plan", &ai.model, usage);
 
@@ -672,7 +776,10 @@ impl Service {
         }
         let points = if key_points.trim().is_empty() { "（工程师未填写要点，请根据任务内容写一个待补充的框架）" } else { key_points };
         let msgs = vec![
-            Message::system(prompts::note_system(cfg.redmine.text_format, &cfg.workflow.note_sections)),
+            Message::system(prompts::with_extra(
+                prompts::note_system(cfg.redmine.text_format, &cfg.workflow.note_sections),
+                &cfg.ai.custom_prompts.note,
+            )),
             Message::user(self.prep_for_ai(&format!(
                 "{ctx}工程师的处理要点：\n{points}\n\n{}",
                 if ids.len() > 1 { "这些任务是合并处理的，请写一份可通用于每个任务的说明。" } else { "" }
@@ -693,8 +800,19 @@ impl Service {
         let cfg = self.config();
         let done_ratio = req.done_ratio.or(cfg.workflow.set_done_ratio.then_some(100));
         let status_id = req.status_id.or(cfg.workflow.resolved_status_id);
+        let files = self.check_attachments(&req.attachments, via)?;
         let mut out = self
-            .apply_update(req.issue_id, &req.notes, status_id, req.assign_to_author, done_ratio, req.private_notes)
+            .apply_update(
+                req.issue_id,
+                UpdatePlan {
+                    notes: Some(req.notes.clone()),
+                    status_id,
+                    assign_to_author: req.assign_to_author,
+                    done_ratio,
+                    private_notes: req.private_notes,
+                    files,
+                },
+            )
             .await?;
         if status_id.is_none() {
             out.warnings.push("未配置“处理完成状态”，本次未修改状态（可在设置 → 工作流中配置）".into());
@@ -743,7 +861,13 @@ impl Service {
             return Err(coded("NOTES_EMPTY", "追问内容不能为空"));
         }
         let status = self.config().workflow.feedback_status_id;
-        let mut out = self.apply_update(id, question, status, true, None, false).await?;
+        let plan = UpdatePlan {
+            notes: Some(question.to_string()),
+            status_id: status,
+            assign_to_author: true,
+            ..Default::default()
+        };
+        let mut out = self.apply_update(id, plan).await?;
         if status.is_none() {
             out.warnings.push("未配置“反馈”状态，本次未修改状态".into());
         }
@@ -756,17 +880,68 @@ impl Service {
         let Some(status) = self.config().workflow.in_progress_status_id else {
             return Err(coded("NO_STATUS", "未配置“进行中”状态（设置 → 工作流）"));
         };
-        self.redmine()?
-            .update_issue(id, &IssueUpdate { status_id: Some(status), ..Default::default() })
-            .await?;
-        let _ = self.detail(id, true).await;
-        self.emit(AppEvent::IssuesChanged);
-        Ok(ResolveOutcome {
-            issue_id: id,
-            ok: true,
-            status: self.status_name(status).await,
+        self.change_status(id, status, None).await
+    }
+
+    /// 只修改状态（看板拖动），可附带一条备注
+    pub async fn change_status(&self, id: u64, status_id: u64, notes: Option<String>) -> Result<ResolveOutcome> {
+        let plan = UpdatePlan {
+            notes: notes.filter(|n| !n.trim().is_empty()),
+            status_id: Some(status_id),
             ..Default::default()
+        };
+        let out = self.apply_update(id, plan).await?;
+        self.emit(AppEvent::IssuesChanged);
+        Ok(out)
+    }
+
+    /// 把前端选择或粘贴的文件暂存到数据目录，回派时再上传（每个任务都要单独上传一份）
+    pub fn stage_attachment(&self, filename: &str, bytes: &[u8]) -> Result<StagedFile> {
+        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+            return Err(coded("UPLOAD_TOO_LARGE", format!("附件不能超过 {} MB", MAX_ATTACHMENT_BYTES / 1024 / 1024)));
+        }
+        let name = sanitize_filename(filename);
+        let dir = self.paths.staging_dir().join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(&name);
+        std::fs::write(&path, bytes)?;
+        Ok(StagedFile {
+            path: path.display().to_string(),
+            content_type: guess_content_type(&name).map(str::to_string),
+            filename: name,
+            size: bytes.len() as u64,
         })
+    }
+
+    /// 校验附件路径。桌面端只能用暂存目录里的文件；MCP 调用方不能读取隐藏目录和 RedPilot 数据目录。
+    fn check_attachments(&self, paths: &[String], via: &str) -> Result<Vec<PathBuf>> {
+        let staging = self.paths.staging_dir().canonicalize().ok();
+        let data_root = self.paths.root.canonicalize().unwrap_or_else(|_| self.paths.root.clone());
+        let mut out = Vec::new();
+        for raw in paths {
+            let p = Path::new(raw.trim());
+            let real = p
+                .canonicalize()
+                .map_err(|_| coded("ATTACHMENT_INVALID", format!("找不到附件：{raw}")))?;
+            let meta = std::fs::metadata(&real)?;
+            if !meta.is_file() {
+                return Err(coded("ATTACHMENT_INVALID", format!("不是文件：{raw}")));
+            }
+            if meta.len() > MAX_ATTACHMENT_BYTES {
+                return Err(coded("UPLOAD_TOO_LARGE", format!("附件超过 {} MB：{raw}", MAX_ATTACHMENT_BYTES / 1024 / 1024)));
+            }
+            let allowed = if via == "app" {
+                staging.as_ref().is_some_and(|s| real.starts_with(s))
+            } else {
+                let hidden = real.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+                !hidden && !real.starts_with(&data_root)
+            };
+            if !allowed {
+                return Err(coded("ATTACHMENT_FORBIDDEN", format!("不允许上传该位置的文件：{raw}（隐藏目录和 RedPilot 数据目录中的文件不能作为附件）")));
+            }
+            out.push(real);
+        }
+        Ok(out)
     }
 
     pub async fn add_note(&self, id: u64, notes: &str, private: bool) -> Result<()> {
@@ -795,19 +970,8 @@ impl Service {
         Ok(errors)
     }
 
-    async fn status_name(&self, id: u64) -> Option<String> {
-        self.statuses().await.ok()?.into_iter().find(|s| s.id == id).map(|s| s.name)
-    }
-
-    async fn apply_update(
-        &self,
-        id: u64,
-        notes: &str,
-        status_id: Option<u64>,
-        assign_to_author: bool,
-        done_ratio: Option<u32>,
-        private_notes: bool,
-    ) -> Result<ResolveOutcome> {
+    async fn apply_update(&self, id: u64, plan: UpdatePlan) -> Result<ResolveOutcome> {
+        let UpdatePlan { notes, status_id, assign_to_author, done_ratio, private_notes, files } = plan;
         let rm = self.redmine()?;
         let issue = rm.get_issue(id).await?;
         let me = self.me().await.ok();
@@ -834,24 +998,40 @@ impl Service {
             }
         }
 
+        // 先上传附件；上传失败时不修改任务（未挂接的上传会被 Redmine 定期清理）
+        let mut uploads = Vec::new();
+        for f in &files {
+            let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "附件".into());
+            let bytes = tokio::fs::read(f).await.with_context(|| format!("读取附件失败: {}", f.display()))?;
+            uploads.push(rm.upload(bytes, &name, guess_content_type(&name)).await?);
+        }
+        let attached: Vec<String> = uploads.iter().map(|u| u.filename.clone()).collect();
+
         rm.update_issue(
             id,
             &IssueUpdate {
-                notes: Some(notes.to_string()),
+                notes,
                 private_notes,
                 status_id,
                 assigned_to_id: assignee.as_ref().map(|a| a.id),
                 done_ratio,
+                uploads,
             },
         )
         .await?;
 
-        if assignee.is_some() {
+        let statuses = self.statuses().await.unwrap_or_default();
+        let target = status_id.and_then(|s| statuses.iter().find(|x| x.id == s));
+        // 自己做的修改直接写回本地缓存，下次同步不会把它当成别人的变更
+        match rm.get_issue(id).await {
+            Ok(fresh) => self.db.apply_own_update(&fresh)?,
+            Err(e) => tracing::warn!("刷新 #{id} 失败: {e}"),
+        }
+        if assignee.is_some() || target.is_some_and(|t| t.is_closed == Some(true)) {
             self.db.set_out_of_inbox(id)?;
         }
-        let _ = self.detail(id, true).await;
         let status = match status_id {
-            Some(s) => self.status_name(s).await.or(Some(format!("状态 #{s}"))),
+            Some(s) => Some(target.map(|t| t.name.clone()).unwrap_or_else(|| format!("状态 #{s}"))),
             None => Some(issue.status.name.clone()),
         };
         Ok(ResolveOutcome {
@@ -859,6 +1039,7 @@ impl Service {
             ok: true,
             assigned_to: assignee.map(|a| a.name).or(issue.assigned_to.map(|a| a.name)),
             status,
+            attached,
             warnings,
             error: None,
         })
@@ -880,6 +1061,8 @@ impl Service {
         let now = chrono::Utc::now();
         let r7 = self.db.resolutions_since(&(now - chrono::Duration::days(7)).to_rfc3339())?;
         let r30 = self.db.resolutions_since(&(now - chrono::Duration::days(30)).to_rfc3339())?;
+        let (prompt_tokens, completion_tokens) = self.db.usage_since(&(now - chrono::Duration::days(30)).to_rfc3339())?;
+        let ai = self.config().ai;
         Ok(Stats {
             open_total: views.len(),
             unread: views.iter().filter(|v| v.unread).count(),
@@ -893,7 +1076,11 @@ impl Service {
             resolved_30d: r30.len(),
             spent_hours_7d: r7.iter().filter_map(|r| r.spent_hours).sum(),
             daily_resolved: self.db.daily_resolved(14)?,
-            ai_tokens_30d: self.db.tokens_since(&(now - chrono::Duration::days(30)).to_rfc3339())?,
+            ai_tokens_30d: prompt_tokens + completion_tokens,
+            ai_prompt_tokens_30d: prompt_tokens,
+            ai_completion_tokens_30d: completion_tokens,
+            ai_cost_30d: (prompt_tokens as f64 * ai.price_input + completion_tokens as f64 * ai.price_output) / 1_000_000.0,
+            ai_currency: ai.currency,
             last_sync_at: self.db.kv_get("last_sync_at")?,
         })
     }
@@ -922,7 +1109,11 @@ impl Service {
                 truncate(&r.notes.replace('\n', " "), 300)
             ));
         }
-        let msgs = vec![Message::system(prompts::report_system(days)), Message::user(self.prep_for_ai(&body))];
+        let extra = self.config().ai.custom_prompts.report;
+        let msgs = vec![
+            Message::system(prompts::with_extra(prompts::report_system(days), &extra)),
+            Message::user(self.prep_for_ai(&body)),
+        ];
         let (text, usage) = ai.chat(&msgs, false).await?;
         self.record_usage("report", &ai.model, usage);
         Ok(strip_fence(&text))
@@ -930,6 +1121,171 @@ impl Service {
 }
 
 // ---------------- 工具函数 ----------------
+
+#[derive(Default)]
+struct UpdatePlan {
+    notes: Option<String>,
+    status_id: Option<u64>,
+    assign_to_author: bool,
+    done_ratio: Option<u32>,
+    private_notes: bool,
+    files: Vec<PathBuf>,
+}
+
+fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok()
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 根据上次同步之后新增的沟通记录，找出别人做的变更（忽略自己的操作）
+fn changes_from_journals(prev: &PrevIssue, is: &Issue, me: Option<u64>) -> Vec<IssueChange> {
+    let Some(since) = parse_time(&prev.updated_on) else { return vec![] };
+    let author_id = is.author.as_ref().map(|a| a.id);
+    let me_s = me.map(|m| m.to_string());
+    let mut out = Vec::new();
+    for j in &is.journals {
+        if !parse_time(&j.created_on).is_some_and(|t| t > since) {
+            continue;
+        }
+        let Some(user) = &j.user else { continue };
+        if Some(user.id) == me {
+            continue;
+        }
+        let by_author = Some(user.id) == author_id;
+        let actor = user.name.clone();
+        let change = |kind: &str, summary: String, important: bool| IssueChange {
+            issue_id: is.id,
+            subject: is.subject.clone(),
+            kind: kind.into(),
+            actor: actor.clone(),
+            by_author,
+            summary,
+            important,
+            created_on: j.created_on.clone(),
+        };
+        if let Some(n) = j.notes.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            let who = if by_author { format!("提出人 {actor}") } else { actor.clone() };
+            out.push(change("reply", format!("{who} 回复：{}", truncate(&one_line(n), 60)), by_author));
+        }
+        for d in j.details.iter().filter(|d| d.property == "attr") {
+            let new = d.new_value.as_deref();
+            match d.name.as_str() {
+                "assigned_to_id" if me_s.is_some() && new == me_s.as_deref() => {
+                    out.push(change("assigned", format!("{actor} 把任务转给了你"), true));
+                }
+                "priority_id" => {
+                    let name = is.priority.as_ref().filter(|p| new == Some(p.id.to_string().as_str())).map(|p| p.name.clone());
+                    let high = name.as_deref().is_some_and(is_high_priority);
+                    out.push(change("priority", format!("{actor} 把优先级调整为 {}", name.unwrap_or_else(|| "新等级".into())), high));
+                }
+                "due_date" => {
+                    out.push(change("due", format!("{actor} 把截止日期改为 {}", new.unwrap_or("无")), false));
+                }
+                "status_id" => {
+                    let name = if new == Some(is.status.id.to_string().as_str()) { is.status.name.clone() } else { "新状态".into() };
+                    out.push(change("status", format!("{actor} 把状态改为 {name}"), false));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// 拿不到沟通记录时，只根据字段对比给出最关键的变化
+fn changes_from_fields(prev: &PrevIssue, is: &Issue) -> Vec<IssueChange> {
+    let base = |kind: &str, summary: String, important: bool| IssueChange {
+        issue_id: is.id,
+        subject: is.subject.clone(),
+        kind: kind.into(),
+        summary,
+        important,
+        created_on: is.updated_on.clone(),
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    if !prev.in_inbox {
+        out.push(base("assigned", "任务重新回到了你的待办".into(), true));
+    }
+    if let Some(p) = is.priority.as_ref().filter(|p| p.id != prev.priority_id) {
+        out.push(base("priority", format!("优先级调整为 {}", p.name), is_high_priority(&p.name)));
+    }
+    if is.due_date != prev.due_date {
+        out.push(base("due", format!("截止日期改为 {}", is.due_date.as_deref().unwrap_or("无")), false));
+    }
+    out
+}
+
+/// 选出最值得在列表里提示的一条：提出人回复 > 转回给我 > 调为高优先级 > 其他回复 > 最新一条
+fn pick_hint(changes: &[IssueChange]) -> Option<&IssueChange> {
+    let rank = |c: &IssueChange| match c.kind.as_str() {
+        "reply" if c.by_author => 5,
+        "assigned" => 4,
+        "priority" if c.important => 3,
+        "reply" => 2,
+        _ => 1,
+    };
+    changes.iter().enumerate().max_by_key(|(i, c)| (rank(c), *i)).map(|(_, c)| c)
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_control() || r#"<>:"|?*"#.contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.').trim().to_string();
+    if cleaned.is_empty() {
+        return "附件".into();
+    }
+    if cleaned.chars().count() > 120 {
+        let (stem, ext) = match cleaned.rsplit_once('.') {
+            Some((s, e)) if e.len() <= 10 => (s.to_string(), format!(".{e}")),
+            _ => (cleaned.clone(), String::new()),
+        };
+        return format!("{}{ext}", stem.chars().take(110).collect::<String>());
+    }
+    cleaned
+}
+
+fn guess_content_type(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls" => "application/vnd.ms-excel",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc" => "application/msword",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "mp4" => "video/mp4",
+        _ => return None,
+    })
+}
+
+/// 清理一天前的暂存附件
+fn cleanup_staging(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let cutoff = SystemTime::now() - Duration::from_secs(24 * 3600);
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
 
 pub fn is_high_priority(name: &str) -> bool {
     let n = name.to_lowercase();
@@ -1091,5 +1447,66 @@ mod tests {
     #[test]
     fn strips_code_fence() {
         assert_eq!(strip_fence("```markdown\n**已处理**\n```"), "**已处理**");
+    }
+
+    #[test]
+    fn sanitizes_filenames() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("C:\\Users\\a\\截图:1.png"), "截图_1.png");
+        assert_eq!(sanitize_filename(".env"), "env");
+        assert_eq!(sanitize_filename("  "), "附件");
+    }
+
+    #[test]
+    fn staged_attachments_are_confined() {
+        let root = std::env::temp_dir().join(format!("redpilot-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let svc = Service::open(Paths { root: root.clone() }).unwrap();
+        let f = svc.stage_attachment("../../截图 1.png", b"png").unwrap();
+        assert_eq!(f.filename, "截图 1.png");
+        assert_eq!(f.content_type.as_deref(), Some("image/png"));
+        assert!(Path::new(&f.path).starts_with(root.join("staging")));
+        assert_eq!(svc.check_attachments(&[f.path.clone()], "app").unwrap().len(), 1);
+        // 桌面端只能提交暂存目录里的文件
+        let outside = root.join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let err = svc.check_attachments(&[outside.display().to_string()], "app").unwrap_err();
+        assert!(err.to_string().contains("ATTACHMENT_FORBIDDEN"));
+        // MCP 不能提交数据目录里的文件（包括暂存目录）
+        let err = svc.check_attachments(&[f.path], "mcp").unwrap_err();
+        assert!(err.to_string().contains("ATTACHMENT_FORBIDDEN"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detects_changes_from_journals() {
+        let issue: Issue = serde_json::from_value(serde_json::json!({
+            "id": 7, "project": {"id": 1, "name": "P"}, "status": {"id": 2, "name": "进行中"},
+            "priority": {"id": 4, "name": "紧急"}, "author": {"id": 11, "name": "张三"}, "subject": "S",
+            "created_on": "2026-11-01T00:00:00Z", "updated_on": "2026-11-02T03:00:00Z",
+            "journals": [
+                {"id": 1, "user": {"id": 11, "name": "张三"}, "notes": "旧回复", "created_on": "2026-11-01T01:00:00Z", "details": []},
+                {"id": 2, "user": {"id": 5, "name": "我"}, "notes": "我的备注", "created_on": "2026-11-02T01:00:00Z", "details": []},
+                {"id": 3, "user": {"id": 11, "name": "张三"}, "notes": "补充了截图\n请查看", "created_on": "2026-11-02T02:00:00Z",
+                 "details": [{"property": "attr", "name": "assigned_to_id", "old_value": "11", "new_value": "5"}]},
+                {"id": 4, "user": {"id": 1, "name": "管理员"}, "notes": "", "created_on": "2026-11-02T03:00:00Z",
+                 "details": [{"property": "attr", "name": "priority_id", "old_value": "2", "new_value": "4"}]}
+            ]
+        }))
+        .unwrap();
+        let prev = PrevIssue {
+            id: 7,
+            updated_on: "2026-11-01T12:00:00Z".into(),
+            in_inbox: false,
+            status_id: 2,
+            priority_id: 2,
+            due_date: None,
+        };
+        let cs = changes_from_journals(&prev, &issue, Some(5));
+        let kinds: Vec<&str> = cs.iter().map(|c| c.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["reply", "assigned", "priority"]);
+        assert_eq!(cs[0].summary, "提出人 张三 回复：补充了截图 请查看");
+        assert!(cs.iter().all(|c| c.important));
+        assert_eq!(pick_hint(&cs).unwrap().kind, "reply");
     }
 }

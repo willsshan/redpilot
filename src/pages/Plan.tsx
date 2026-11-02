@@ -10,7 +10,7 @@ import { Markdown } from "../components/Markdown";
 import { ResolveDialog } from "../components/ResolveDialog";
 
 export function PlanPage() {
-  const { rev, setPage, setFocusIssue, secrets } = useApp();
+  const { rev, setPage, setFocusIssue, secrets, intent, clearIntent } = useApp();
   const toast = useToast();
   const [plan, setPlan] = useState<Plan | null>(null);
   const [issues, setIssues] = useState<IssueView[]>([]);
@@ -23,6 +23,14 @@ export function PlanPage() {
   useEffect(() => {
     api.listIssues({ includeDone: true }).then(setIssues).catch(() => {});
   }, [rev]);
+
+  useEffect(() => {
+    if (intent?.type === "generatePlan") {
+      clearIntent();
+      void generate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intent]);
 
   const byId = useMemo(() => new Map(issues.map((i) => [i.id, i])), [issues]);
   const openCount = issues.filter((i) => i.inInbox).length;

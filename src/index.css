@@ -134,7 +134,12 @@ button {
   cursor: default;
 }
 
-:focus-visible {
+/* 输入框有自己的聚焦样式，这里只处理按钮、链接等 */
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[role="switch"]:focus-visible,
+[tabindex]:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
   outline-offset: 1px;
 }
@@ -151,6 +156,21 @@ button {
 }
 .animate-in {
   animation: rp-fade-in 160ms ease-out;
+}
+
+.animate-slide-in {
+  animation: rp-slide-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes rp-slide-in {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
 }
 
 @keyframes rp-shimmer {

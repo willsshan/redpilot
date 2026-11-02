@@ -1,18 +1,37 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import clsx from "clsx";
-import { Check, CornerUpLeft, Inbox as InboxIcon, PlugZap, RefreshCw, Search, Sparkles, X } from "lucide-react";
-import { api, errorText, type IssueDetail as Detail, type IssueView } from "../lib/api";
+import { Check, CornerUpLeft, Inbox as InboxIcon, Kanban, LayoutList, MessageSquareText, PlugZap, RefreshCw, Search, Sparkles, X } from "lucide-react";
+import { api, errorText, type IssueDetail as Detail, type IssueView, type NamedId } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { categoryColor, dueLabel, isMac, priorityTone, relativeTime } from "../lib/format";
 import { Avatar, Badge, Button, CategoryBadge, Empty, Kbd } from "../components/ui";
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
+import { Board, type GroupBy } from "../components/Board";
 
-type Quick = "all" | "unread" | "overdue" | "missing";
+type Quick = "all" | "unread" | "changed" | "overdue" | "missing";
+type View = "list" | "board";
+
+function stored<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key) as T | null;
+    return v && allowed.includes(v) ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function remember(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // 无法写入时只影响记住视图
+  }
+}
 
 export function InboxPage() {
-  const { rev, config, secrets, setPage, syncing, sync, analyzing, focusIssue, setFocusIssue } = useApp();
+  const { rev, bump, config, secrets, setPage, syncing, sync, analyzing, focusIssue, setFocusIssue, intent, clearIntent } = useApp();
   const toast = useToast();
   const [issues, setIssues] = useState<IssueView[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -26,7 +45,28 @@ export function InboxPage() {
   const [resolveFor, setResolveFor] = useState<IssueView[] | null>(null);
   const [followUp, setFollowUp] = useState(false);
   const [analyzingAll, setAnalyzingAll] = useState(false);
+  const [view, setViewState] = useState<View>(() => stored("rp.inbox.view", ["list", "board"] as const, "list"));
+  const [groupBy, setGroupByState] = useState<GroupBy>(() => stored("rp.board.group", ["status", "category", "urgency"] as const, "status"));
+  const [drawer, setDrawer] = useState(false);
+  const [statuses, setStatuses] = useState<NamedId[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
+
+  const setView = useCallback((v: View) => {
+    setViewState(v);
+    remember("rp.inbox.view", v);
+    setDrawer(false);
+  }, []);
+  const setGroupBy = (g: GroupBy) => {
+    setGroupByState(g);
+    remember("rp.board.group", g);
+  };
+
+  useEffect(() => {
+    if (intent?.type === "inboxView") {
+      setView(intent.view);
+      clearIntent();
+    }
+  }, [intent, clearIntent, setView]);
 
   const configured = !!config?.redmine.baseUrl && secrets.redmine;
 
@@ -42,18 +82,24 @@ export function InboxPage() {
     void load();
   }, [load, rev]);
 
-  // 从规划页跳转过来时聚焦指定任务
+  useEffect(() => {
+    if (view === "board" && configured) api.statuses().then((xs) => setStatuses(xs.filter((x) => !x.isClosed))).catch(() => {});
+  }, [view, configured]);
+
+  // 从规划页或命令面板跳转过来时聚焦指定任务
   useEffect(() => {
     if (focusIssue !== null) {
       setSelected(focusIssue);
       setFocusIssue(null);
+      if (view === "board") setDrawer(true);
     }
-  }, [focusIssue, setFocusIssue]);
+  }, [focusIssue, setFocusIssue, view]);
 
   const visible = useMemo(() => {
     return issues.filter((i) => {
       if (category && (i.analysis.category ?? "未分类") !== category) return false;
       if (quick === "unread" && !i.unread) return false;
+      if (quick === "changed" && !i.changeHint) return false;
       if (quick === "overdue" && !i.overdue) return false;
       if (quick === "missing" && i.analysis.missingInfo.length === 0) return false;
       return true;
@@ -69,11 +115,11 @@ export function InboxPage() {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   }, [issues]);
 
-  // 默认选中第一条
+  // 列表视图默认选中第一条
   useEffect(() => {
-    if (visible.length === 0) return;
+    if (visible.length === 0 || view === "board") return;
     if (selected === null || !issues.some((i) => i.id === selected)) setSelected(visible[0].id);
-  }, [visible, issues, selected]);
+  }, [visible, issues, selected, view]);
 
   const loadDetail = useCallback(
     async (id: number, refresh = false) => {
@@ -83,7 +129,7 @@ export function InboxPage() {
         setDetail(d);
         if (d.view.unread) {
           await api.markRead(id);
-          setIssues((xs) => xs.map((x) => (x.id === id ? { ...x, unread: false } : x)));
+          setIssues((xs) => xs.map((x) => (x.id === id ? { ...x, unread: false, changeHint: null } : x)));
         }
       } catch (e) {
         toast.show({ tone: "error", title: `加载 #${id} 失败`, body: errorText(e) });
@@ -103,7 +149,7 @@ export function InboxPage() {
   useEffect(() => {
     if (selected === null) return;
     const v = issues.find((i) => i.id === selected);
-    if (v && detail && detail.view.id === v.id) setDetail({ ...detail, view: { ...v, unread: false } });
+    if (v && detail && detail.view.id === v.id) setDetail({ ...detail, view: { ...v, unread: false, changeHint: null } });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issues]);
 
@@ -115,6 +161,17 @@ export function InboxPage() {
       const t = e.target as HTMLElement;
       if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || resolveFor || followUp) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (view === "board") {
+        if (e.key === "Escape" && drawer) setDrawer(false);
+        else if (e.key === "r" && drawer && current) {
+          e.preventDefault();
+          setResolveFor([current]);
+        } else if (e.key === "/") {
+          e.preventDefault();
+          searchRef.current?.focus();
+        }
+        return;
+      }
       const idx = visible.findIndex((i) => i.id === selected);
       if (e.key === "j" || e.key === "ArrowDown") {
         e.preventDefault();
@@ -165,6 +222,33 @@ export function InboxPage() {
     }
   }
 
+  // 看板拖动：状态分组改 Redmine 状态，分类分组改本地分类
+  async function moveCard(issue: IssueView, key: string) {
+    if (groupBy === "category") {
+      const cat = key === "未分类" ? null : key;
+      setIssues((xs) => xs.map((x) => (x.id === issue.id ? { ...x, analysis: { ...x.analysis, category: cat, categorySource: "manual" } } : x)));
+      try {
+        await api.setClassification(issue.id, cat, issue.analysis.module ?? null);
+      } catch (e) {
+        toast.show({ tone: "error", title: "修改分类失败", body: errorText(e) });
+        bump();
+      }
+      return;
+    }
+    const statusId = Number(key);
+    const name = statuses.find((s) => s.id === statusId)?.name ?? "";
+    setIssues((xs) => xs.map((x) => (x.id === issue.id ? { ...x, statusId, statusName: name } : x)));
+    try {
+      const out = await api.changeStatus(issue.id, statusId);
+      toast.show({ tone: out.warnings.length ? "warn" : "success", title: `#${issue.id} 已改为“${out.status ?? name}”`, body: out.warnings.join("\n") || undefined });
+    } catch (e) {
+      setIssues((xs) => xs.map((x) => (x.id === issue.id ? { ...x, statusId: issue.statusId, statusName: issue.statusName } : x)));
+      toast.show({ tone: "error", title: `#${issue.id} 无法改为“${name}”`, body: errorText(e) });
+    }
+  }
+
+  const categories = [...new Set([...(config?.rules.map((r) => r.category) ?? []), "其他"])];
+
   if (!configured) {
     return (
       <Empty
@@ -204,6 +288,39 @@ export function InboxPage() {
           </span>
         </div>
         <div className="flex-1" data-tauri-drag-region />
+        {view === "board" && (
+          <select
+            value={groupBy}
+            onChange={(e) => setGroupBy(e.target.value as GroupBy)}
+            className="h-8 rounded-lg border border-line bg-panel px-2 text-[12.5px] text-ink-2 focus:border-accent focus:outline-none"
+            title="看板分组"
+          >
+            <option value="status">按状态分组</option>
+            <option value="category">按分类分组</option>
+            <option value="urgency">按紧急度分组</option>
+          </select>
+        )}
+        <div className="flex h-8 items-center rounded-lg border border-line bg-sunken p-0.5">
+          {(
+            [
+              ["list", LayoutList, "列表"],
+              ["board", Kanban, "看板"],
+            ] as const
+          ).map(([v, Icon, label]) => (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              title={`${label}视图`}
+              className={clsx(
+                "flex h-full items-center gap-1 rounded-md px-2 text-[12.5px]",
+                view === v ? "bg-panel font-medium text-ink shadow-sm" : "text-ink-3 hover:text-ink",
+              )}
+            >
+              <Icon className="size-3.5" />
+              {label}
+            </button>
+          ))}
+        </div>
         <Button variant="ai" icon={<Sparkles className="size-3.5" />} loading={analyzingAll || analyzing > 0} onClick={() => void analyzeAll()}>
           {checked.size > 0 ? `AI 分析所选 ${checked.size}` : "AI 分析"}
         </Button>
@@ -227,6 +344,7 @@ export function InboxPage() {
         {(
           [
             ["unread", "未读"],
+            ["changed", "有新动态"],
             ["overdue", "已逾期"],
             ["missing", "信息不足"],
           ] as const
@@ -237,6 +355,42 @@ export function InboxPage() {
         ))}
       </div>
 
+      {view === "board" ? (
+        <div className="relative min-h-0 flex-1">
+          {loaded && issues.length === 0 ? (
+            <Empty icon={<InboxIcon className="size-6" />} title="收件箱已清空" desc="当前没有指派给你的未关闭任务，休息一下吧。" />
+          ) : (
+            <Board
+              issues={visible}
+              groupBy={groupBy}
+              statuses={statuses}
+              categories={categories}
+              selectedId={drawer ? selected : null}
+              onOpen={(id) => {
+                setSelected(id);
+                setDrawer(true);
+              }}
+              onMove={(i, k) => void moveCard(i, k)}
+              onResolve={(i) => setResolveFor([i])}
+            />
+          )}
+          {drawer && current && (
+            <>
+              <div className="absolute inset-0 bg-black/15" onClick={() => setDrawer(false)} />
+              <div className="animate-slide-in absolute inset-y-0 right-0 w-[min(860px,78%)] border-l border-line bg-canvas shadow-pop">
+                <IssueDetail
+                  detail={detail && detail.view.id === current.id ? detail : null}
+                  loading={detailLoading}
+                  onRefresh={() => void loadDetail(current.id, true)}
+                  onResolve={() => setResolveFor([current])}
+                  onFollowUp={() => setFollowUp(true)}
+                  onClose={() => setDrawer(false)}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      ) : (
       <div className="flex min-h-0 flex-1">
         {/* 列表 */}
         <div className="relative w-[400px] shrink-0 overflow-y-auto border-r border-line">
@@ -296,6 +450,7 @@ export function InboxPage() {
           )}
         </div>
       </div>
+      )}
 
       <ResolveDialog
         open={!!resolveFor}
@@ -371,7 +526,14 @@ function IssueRow({
           <span className="ml-auto shrink-0">{relativeTime(i.updatedOn)}</span>
         </div>
         <div className={clsx("mt-0.5 line-clamp-2 text-[13.5px] leading-snug text-ink", i.unread ? "font-semibold" : "font-medium")}>{i.subject}</div>
-        {a.summary && <div className="mt-0.5 truncate text-[12.5px] text-ink-3">{a.summary}</div>}
+        {i.changeHint ? (
+          <div className="mt-0.5 flex items-center gap-1 truncate text-[12.5px] text-accent-ink">
+            <MessageSquareText className="size-3 shrink-0" />
+            <span className="truncate">{i.changeHint}</span>
+          </div>
+        ) : (
+          a.summary && <div className="mt-0.5 truncate text-[12.5px] text-ink-3">{a.summary}</div>
+        )}
         <div className="mt-1.5 flex items-center gap-1.5">
           <CategoryBadge category={a.category} source={a.categorySource} />
           {a.module && <Badge>{a.module}</Badge>}

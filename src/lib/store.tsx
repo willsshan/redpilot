@@ -4,6 +4,13 @@ import { useToast } from "./toast";
 
 export type Page = "inbox" | "plan" | "dashboard" | "settings";
 
+/** 命令面板等处发给页面的指令，由对应页面执行后清除 */
+export type Intent =
+  | { type: "inboxView"; view: "list" | "board" }
+  | { type: "generatePlan" }
+  | { type: "report"; days: number }
+  | { type: "settingsSection"; id: string };
+
 interface AppState {
   page: Page;
   setPage: (p: Page) => void;
@@ -23,6 +30,10 @@ interface AppState {
   /** 收件箱要聚焦的任务（从规划页跳转） */
   focusIssue: number | null;
   setFocusIssue: (id: number | null) => void;
+  intent: Intent | null;
+  /** 跳转到页面并让页面执行指令 */
+  dispatch: (page: Page, intent?: Intent) => void;
+  clearIntent: () => void;
 }
 
 const Ctx = createContext<AppState | null>(null);
@@ -48,6 +59,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [analyzing, setAnalyzing] = useState(0);
   const [rev, setRev] = useState(0);
   const [focusIssue, setFocusIssue] = useState<number | null>(null);
+  const [intent, setIntent] = useState<Intent | null>(null);
+  const dispatch = useCallback((p: Page, i?: Intent) => {
+    setPage(p);
+    setIntent(i ?? null);
+  }, []);
+  const clearIntent = useCallback(() => setIntent(null), []);
 
   const bump = useCallback(() => setRev((r) => r + 1), []);
   const reloadConfig = useCallback(async () => setConfig(await api.getConfig()), []);
@@ -85,7 +102,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setSyncing(false);
           bump();
           const n = e.report.newIds.length;
+          const important = e.report.changes.filter((c) => c.important);
           if (n > 0) toast.show({ tone: "success", title: `同步完成，新增 ${n} 个任务`, body: `当前共 ${e.report.total} 个待办` });
+          if (important.length > 0)
+            toast.show({
+              tone: "info",
+              title: `${new Set(important.map((c) => c.issueId)).size} 个任务有新动态`,
+              body: important
+                .slice(-3)
+                .map((c) => `#${c.issueId} ${c.summary}`)
+                .join("\n"),
+            });
           break;
         }
         case "syncFailed":
@@ -132,6 +159,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         sync,
         focusIssue,
         setFocusIssue,
+        intent,
+        dispatch,
+        clearIntent,
       }}
     >
       {children}

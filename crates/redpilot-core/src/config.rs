@@ -33,6 +33,11 @@ impl Paths {
     pub fn secrets_file(&self) -> PathBuf {
         self.root.join("secrets.json")
     }
+
+    /// 回派前暂存的附件
+    pub fn staging_dir(&self) -> PathBuf {
+        self.root.join("staging")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +108,10 @@ pub struct SyncConfig {
     pub query_id: Option<u64>,
     /// 有新任务时发系统通知
     pub notify: bool,
+    /// 提出人回复、任务被转回、调为高优先级时发通知
+    pub notify_changes: bool,
+    /// 任务今天或明天到期时提醒（每天一次）
+    pub notify_due: bool,
     /// 新任务自动做 AI 分析
     pub auto_analyze: bool,
 }
@@ -116,6 +125,8 @@ impl Default for SyncConfig {
             project: String::new(),
             query_id: None,
             notify: true,
+            notify_changes: true,
+            notify_due: true,
             auto_analyze: true,
         }
     }
@@ -176,6 +187,22 @@ pub struct AiConfig {
     pub excluded_project_ids: Vec<u64>,
     /// 每次请求合并分析的任务数
     pub batch_size: usize,
+    /// 每百万输入 token 单价（用于估算费用）
+    pub price_input: f64,
+    /// 每百万输出 token 单价
+    pub price_output: f64,
+    pub currency: String,
+    /// 追加到各环节系统提示词后面的团队要求
+    pub custom_prompts: CustomPrompts,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CustomPrompts {
+    pub classify: String,
+    pub plan: String,
+    pub note: String,
+    pub report: String,
 }
 
 impl Default for AiConfig {
@@ -190,6 +217,11 @@ impl Default for AiConfig {
             mask_sensitive: true,
             excluded_project_ids: vec![],
             batch_size: 8,
+            // DeepSeek 官网标价（缓存未命中），价格调整时在设置中修改
+            price_input: 2.0,
+            price_output: 3.0,
+            currency: "¥".into(),
+            custom_prompts: CustomPrompts::default(),
         }
     }
 }

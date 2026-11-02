@@ -11,7 +11,7 @@
 ![Rust](https://img.shields.io/badge/Rust-Tauri%202-orange?logo=rust)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
-![MCP](https://img.shields.io/badge/MCP-18%20tools-8e4ec6)
+![MCP](https://img.shields.io/badge/MCP-20%20tools-8e4ec6)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -32,13 +32,21 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 - 同步范围：指派给我、我关注的、Redmine 中已保存的查询，可以限定项目
 - 后台定时同步，关闭窗口后在托盘中继续运行
 - 新任务弹出系统通知，菜单栏显示未读数
+- **动态提醒**：提出人回复、任务被转回给你、被调为高优先级、今天或明天到期时提醒；你自己的操作不会提醒
+- 开机自动启动，在托盘中静默运行
 - 本地 SQLite 缓存，打开快，离线也能查看
+
+### 🗂️ 工作台
+- 列表和**看板**两种视图；看板可按状态、分类或紧急度分组
+- 拖动卡片即可修改 Redmine 状态，拖到底部回派区直接回派
+- **⌘K / Ctrl+K 命令面板**：搜索任务、跳转页面、执行同步、分析、规划、日报和周报
 
 ### 🧠 AI 分析与分类
 - 关键词规则离线预分类，不消耗 token
 - DeepSeek 给出分类、模块、紧急度、难度、预估工时、一句话摘要和处理思路
 - **信息不足检测**：自动写好追问话术，一键发给提出人（状态改为“反馈”）
 - 人工修正的分类会作为样例反馈给 AI，用得越多分得越准
+- 可以为分类、规划、处置说明、报告分别追加团队自定义提示词
 
 ### 🧩 合并规划
 - 先用本地 TF-IDF 预聚类，再由 AI 判断哪些任务**可以一起做**，并说明理由和处理思路
@@ -48,12 +56,13 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 ### ↩️ 一键回派
 - 写几句处理要点，由 **AI 扩写成处置说明**（问题原因 / 处理方法 / 处理结果 / 影响范围 / 验证建议）
 - 点一下同时完成：写入说明、切换状态、**指派回提出人**、完成度 100%、登记工时
+- **附件**：粘贴截图会自动作为附件插入说明，也可以选择或拖入文件；批量回派时分别上传到每个任务
 - 合并处理的任务可以批量回派；提交后 5 秒内可以撤销
 - 能识别提出人不可指派、提出人是自己、工作流不允许该状态等情况，给出明确提示
 
 ### 📊 统计与报告
 - 待办、逾期、高优先级、回派趋势、工时、AI 用量
-- AI 一键生成日报、周报
+- AI 一键生成日报、周报；按单价估算 AI 费用
 
 ### 🔐 安全与隐私
 - API Key 存在系统钥匙串（macOS Keychain / Windows 凭据管理器）
@@ -63,11 +72,19 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 
 <table>
   <tr>
+    <td><img src="docs/screenshots/board.png" alt="看板" /></td>
+    <td><img src="docs/screenshots/palette.png" alt="命令面板" /></td>
+  </tr>
+  <tr>
+    <td align="center">看板：拖动改状态、拖到回派区</td>
+    <td align="center">⌘K 命令面板</td>
+  </tr>
+  <tr>
     <td><img src="docs/screenshots/resolve.png" alt="一键回派" /></td>
     <td><img src="docs/screenshots/plan.png" alt="AI 合并规划" /></td>
   </tr>
   <tr>
-    <td align="center">一键回派给提出人</td>
+    <td align="center">一键回派：AI 说明 + 粘贴截图</td>
     <td align="center">AI 合并规划</td>
   </tr>
   <tr>
@@ -134,10 +151,10 @@ claude mcp add --transport http redpilot http://127.0.0.1:39217/mcp \
 
 | 类型 | 工具 |
 |---|---|
-| 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `draft_resolution_note` · `set_classification` · `work_report` |
-| 写操作（需授权） | `resolve_issue` · `batch_resolve` · `request_more_info` · `start_progress` · `add_note` · `link_issues` |
+| 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_recent_changes` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `draft_resolution_note` · `set_classification` · `work_report` |
+| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
 
-写操作会直接修改 Redmine 并通知相关人员，需要在设置中手动开启“允许外部 AI 执行写操作”。
+写操作会直接修改 Redmine 并通知相关人员，需要在设置中手动开启“允许外部 AI 执行写操作”。通过 MCP 上传附件时，隐藏目录和 RedPilot 数据目录中的文件会被拒绝。
 
 <p align="center">
   <img src="docs/screenshots/settings-mcp.png" width="720" alt="MCP 设置" />
@@ -171,6 +188,8 @@ npm run tauri build
 ```
 
 macOS 生成 `.app` / `.dmg`，Windows 生成 `.msi` / `.exe`。
+
+推送 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）后，GitHub Actions 会自动构建 macOS 通用版和 Windows 安装包，并创建草稿 Release。
 
 **环境要求**：Rust 1.88+、Node.js 20+。Windows 还需要 [Visual Studio C++ 生成工具](https://visualstudio.microsoft.com/visual-cpp-build-tools/) 和 WebView2（Windows 10/11 一般已自带）。
 
@@ -217,9 +236,8 @@ redpilot/
 - [x] 相似历史知识库、计时与工时、日报 / 周报
 - [x] MCP 服务（HTTP + stdio）
 - [ ] 多服务器 / 多账号
-- [ ] 看板视图、⌘K 命令面板
-- [ ] 回派时上传附件
-- [ ] 开机自启、自动更新、安装包签名
+- [x] 看板视图、⌘K 命令面板、回派附件、动态与到期提醒、开机自启（v0.2）
+- [ ] 自动更新、安装包签名
 
 完整清单见 [docs/产品功能清单.md](docs/产品功能清单.md)。
 
@@ -229,6 +247,8 @@ redpilot/
 cargo test -p redpilot-core   # 核心逻辑单元测试
 npm run typecheck             # 前端类型检查
 ```
+
+每次推送到 main 时，CI 会在 macOS 和 Windows 上分别构建并运行测试。
 
 ## 👤 作者
 

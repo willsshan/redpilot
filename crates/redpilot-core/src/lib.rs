@@ -30,6 +30,11 @@ impl std::fmt::Display for CodedError {
 
 impl std::error::Error for CodedError {}
 
+/// 本地日期，格式 YYYY-MM-DD
+pub fn local_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 pub fn coded(code: &'static str, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CodedError {
         code,

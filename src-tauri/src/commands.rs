@@ -8,7 +8,9 @@ use redpilot_core::{AppConfig, Service};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::Mutex;
 
@@ -197,6 +199,47 @@ pub async fn request_more_info(state: State<'_, AppState>, id: u64, question: St
 #[tauri::command]
 pub async fn start_progress(state: State<'_, AppState>, id: u64) -> CmdResult<ResolveOutcome> {
     state.svc.start_progress(id).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn change_status(
+    state: State<'_, AppState>,
+    id: u64,
+    status_id: u64,
+    notes: Option<String>,
+) -> CmdResult<ResolveOutcome> {
+    state.svc.change_status(id, status_id, notes).await.map_err(e)
+}
+
+/// 前端以原始二进制发送文件内容，文件名放在 `x-filename` 头里（URL 编码）
+#[tauri::command]
+pub fn stage_attachment(state: State<'_, AppState>, request: Request<'_>) -> CmdResult<StagedFile> {
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err("附件数据格式错误".into());
+    };
+    let name = request
+        .headers()
+        .get("x-filename")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| percent_encoding::percent_decode_str(v).decode_utf8_lossy().to_string())
+        .unwrap_or_default();
+    state.svc.stage_attachment(&name, bytes).map_err(e)
+}
+
+#[tauri::command]
+pub fn recent_changes(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec<IssueChange>> {
+    state.svc.recent_changes(limit).map_err(e)
+}
+
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> CmdResult<bool> {
+    app.autolaunch().is_enabled().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<()> {
+    let al = app.autolaunch();
+    if enabled { al.enable() } else { al.disable() }.map_err(|err| err.to_string())
 }
 
 #[tauri::command]

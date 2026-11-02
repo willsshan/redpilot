@@ -5,7 +5,7 @@ import { api, errorText, type AppConfig, type NamedId } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { isMac } from "../lib/format";
-import { Badge, Button, Card, Field, Input, Select, Switch } from "../components/ui";
+import { Badge, Button, Card, Field, Input, Select, Switch, Textarea } from "../components/ui";
 
 const DEFAULT_RULES: AppConfig["rules"] = [
   { category: "缺陷", keywords: ["报错", "错误", "异常", "bug", "崩溃", "失败", "无法", "不能", "闪退", "白屏", "500", "exception"] },
@@ -18,7 +18,7 @@ const DEFAULT_RULES: AppConfig["rules"] = [
 
 const SECTIONS = [
   { id: "redmine", label: "Redmine 连接", icon: Server },
-  { id: "sync", label: "同步", icon: RefreshCw },
+  { id: "sync", label: "同步与提醒", icon: RefreshCw },
   { id: "workflow", label: "工作流", icon: Workflow },
   { id: "ai", label: "AI 模型", icon: Bot },
   { id: "mcp", label: "MCP 服务", icon: Plug },
@@ -26,7 +26,7 @@ const SECTIONS = [
 ] as const;
 
 export function SettingsPage() {
-  const { config, reloadConfig, secrets, reloadSecrets, mcp, reloadMcp, bump } = useApp();
+  const { config, reloadConfig, secrets, reloadSecrets, mcp, reloadMcp, bump, intent, clearIntent } = useApp();
   const toast = useToast();
   const [draft, setDraft] = useState<AppConfig | null>(null);
   const [saving, setSaving] = useState(false);
@@ -37,10 +37,33 @@ export function SettingsPage() {
   const [activities, setActivities] = useState<NamedId[]>([]);
   const [projects, setProjects] = useState<{ id: number; name: string }[]>([]);
   const [clientTab, setClientTab] = useState<"claude" | "http" | "stdio">("claude");
+  const [autostart, setAutostart] = useState<boolean | null>(null);
 
   useEffect(() => {
     if (config) setDraft(structuredClone(config));
   }, [config]);
+
+  useEffect(() => {
+    api.getAutostart().then(setAutostart).catch(() => setAutostart(null));
+  }, []);
+
+  // 命令面板跳转到指定小节
+  useEffect(() => {
+    if (intent?.type !== "settingsSection" || !draft) return;
+    const id = intent.id;
+    clearIntent();
+    window.setTimeout(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+  }, [intent, clearIntent, draft]);
+
+  async function toggleAutostart(v: boolean) {
+    try {
+      await api.setAutostart(v);
+      setAutostart(v);
+      toast.show({ tone: "success", title: v ? "已设置开机自动启动" : "已取消开机自动启动" });
+    } catch (e) {
+      toast.show({ tone: "error", title: "设置开机启动失败", body: errorText(e) });
+    }
+  }
 
   useEffect(() => {
     if (!secrets.redmine) return;
@@ -219,7 +242,10 @@ export function SettingsPage() {
             </Section>
 
             {/* 同步 */}
-            <Section id="sync" title="同步" desc="RedPilot 在后台按间隔拉取任务，关闭窗口后仍在托盘中运行。">
+            <Section id="sync" title="同步与提醒" desc="RedPilot 在后台按间隔拉取任务，关闭窗口后仍在托盘中运行。">
+              {autostart !== null && (
+                <Toggle label="开机自动启动" desc="登录系统后在托盘中静默运行，按时同步并提醒；此项立即生效" checked={autostart} onChange={(v) => void toggleAutostart(v)} />
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <Field label="自动同步间隔">
                   <Select value={draft.sync.intervalMinutes} onChange={(e) => set("sync", { intervalMinutes: Number(e.target.value) })}>
@@ -247,7 +273,14 @@ export function SettingsPage() {
                 />
                 </div>
               </Field>
-              <Toggle label="新任务系统通知" checked={draft.sync.notify} onChange={(v) => set("sync", { notify: v })} />
+              <Toggle label="新任务通知" checked={draft.sync.notify} onChange={(v) => set("sync", { notify: v })} />
+              <Toggle
+                label="重要动态通知"
+                desc="提出人回复、任务被转回给你、被调为高优先级时提醒；你自己的操作不会提醒"
+                checked={draft.sync.notifyChanges}
+                onChange={(v) => set("sync", { notifyChanges: v })}
+              />
+              <Toggle label="到期提醒" desc="任务今天或明天到期时提醒，每个任务每天最多一次" checked={draft.sync.notifyDue} onChange={(v) => set("sync", { notifyDue: v })} />
               <Toggle label="新任务自动 AI 分析" desc="同步到新任务或任务有更新时，自动调用 AI 做分类与摘要" checked={draft.sync.autoAnalyze} onChange={(v) => set("sync", { autoAnalyze: v })} />
             </Section>
 
@@ -307,6 +340,17 @@ export function SettingsPage() {
                   <Input type="number" min={0} max={1.5} step={0.1} value={draft.ai.temperature} onChange={(e) => set("ai", { temperature: Number(e.target.value) })} />
                 </Field>
               </div>
+              <div className="grid grid-cols-[1fr_1fr_100px] gap-4">
+                <Field label="输入单价（每百万 token）" hint="用于在统计页估算费用">
+                  <Input type="number" min={0} step={0.1} value={draft.ai.priceInput} onChange={(e) => set("ai", { priceInput: Number(e.target.value) || 0 })} />
+                </Field>
+                <Field label="输出单价（每百万 token）" hint="默认按 DeepSeek 官网标价，价格调整时请修改">
+                  <Input type="number" min={0} step={0.1} value={draft.ai.priceOutput} onChange={(e) => set("ai", { priceOutput: Number(e.target.value) || 0 })} />
+                </Field>
+                <Field label="货币符号">
+                  <Input value={draft.ai.currency} onChange={(e) => set("ai", { currency: e.target.value })} placeholder="¥" />
+                </Field>
+              </div>
               <Toggle label="JSON 输出模式" desc="部分推理模型或本地模型不支持时请关闭" checked={draft.ai.jsonMode} onChange={(v) => set("ai", { jsonMode: v })} />
               <Toggle label="发送前脱敏" desc="自动遮盖手机号、身份证、邮箱、IP、密码、密钥串等" checked={draft.ai.maskSensitive} onChange={(v) => set("ai", { maskSensitive: v })} />
               {projects.length > 0 && (
@@ -330,6 +374,34 @@ export function SettingsPage() {
                   </div>
                 </Field>
               )}
+              <details className="group rounded-xl border border-line" open={Object.values(draft.ai.customPrompts).some((v) => v.trim())}>
+                <summary className="flex cursor-default list-none items-center justify-between px-3.5 py-2.5">
+                  <span>
+                    <span className="text-[13px] font-medium text-ink">自定义提示词</span>
+                    <span className="ml-2 text-[12px] text-ink-3">追加到各环节的系统提示词后面，例如团队术语、模块划分、说明的语气</span>
+                  </span>
+                  <span className="text-[12px] text-ink-3 group-open:hidden">展开</span>
+                </summary>
+                <div className="space-y-3 border-t border-line p-3.5">
+                  {(
+                    [
+                      ["classify", "分类与分析", "例如：模块只能从「订单、库存、财务、权限、报表」中选择；涉及生产数据的任务紧急度至少为“中”"],
+                      ["plan", "合并规划", "例如：同一个客户的任务尽量放在同一组；周五下午不安排发布"],
+                      ["note", "处置说明", "例如：结尾加上“如有疑问请联系运维组 8008”；不要使用技术术语"],
+                      ["report", "日报 / 周报", "例如：按项目分组汇总；最后列出下周计划"],
+                    ] as const
+                  ).map(([k, label, placeholder]) => (
+                    <Field key={k} label={label}>
+                      <Textarea
+                        rows={2}
+                        value={draft.ai.customPrompts[k]}
+                        onChange={(e) => set("ai", { customPrompts: { ...draft.ai.customPrompts, [k]: e.target.value } })}
+                        placeholder={placeholder}
+                      />
+                    </Field>
+                  ))}
+                </div>
+              </details>
               <div>
                 <Button icon={<CheckCircle2 className="size-3.5" />} loading={testing === "ai"} onClick={() => void testAi()}>
                   测试 AI 连接

@@ -1,6 +1,6 @@
 //! 本地 SQLite 缓存（WAL 模式，桌面端与 stdio MCP 进程可同时访问）。
 
-use crate::models::{Analysis, Issue, IssueFilter, IssueView, Plan, ResolutionRecord};
+use crate::models::{Analysis, Issue, IssueChange, IssueFilter, IssueView, Plan, ResolutionRecord};
 use anyhow::Result;
 use chrono::{Local, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -90,14 +90,49 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS issue_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
+    by_author INTEGER NOT NULL DEFAULT 0,
+    important INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL,
+    created_on TEXT NOT NULL,
+    detected_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_changes_detected ON issue_changes(detected_at);
 "#;
+
+/// 旧版本数据库缺少的列
+const MIGRATIONS: [(&str, &str, &str); 1] = [("issues", "change_hint", "TEXT")];
+
+/// 同步前任务在本地的状态，用于判断别人改了什么
+#[derive(Debug, Clone)]
+pub struct PrevIssue {
+    pub id: u64,
+    pub updated_on: String,
+    pub in_inbox: bool,
+    pub status_id: u64,
+    pub priority_id: u64,
+    pub due_date: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct SyncDiff {
+    pub new_ids: Vec<u64>,
+    pub updated: Vec<PrevIssue>,
+    pub removed: usize,
+}
 
 const VIEW_COLUMNS: &str = "i.id, i.project_id, i.project_name, i.tracker_name, i.status_id, i.status_name,
     i.priority_id, i.priority_name, i.author_id, i.author_name, i.assigned_to_id, i.assigned_to_name,
     i.subject, i.description, i.done_ratio, i.due_date, i.created_on, i.updated_on, i.in_inbox,
     i.read_updated_on,
     a.rule_category, a.ai_category, a.ai_module, a.urgency, a.difficulty, a.est_hours, a.summary,
-    a.missing_info, a.follow_up, a.suggestion, a.ai_issue_updated_on, a.manual_category, a.manual_module";
+    a.missing_info, a.follow_up, a.suggestion, a.ai_issue_updated_on, a.manual_category, a.manual_module,
+    i.change_hint";
 
 /// 优先级名称里带这些字的视为高优先级
 pub const HIGH_PRIORITY_WORDS: [&str; 6] = ["高", "紧急", "立刻", "urgent", "high", "immediate"];
@@ -113,6 +148,14 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        for (table, column, ty) in MIGRATIONS {
+            let exists: bool = conn
+                .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+                .exists([column])?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -135,24 +178,32 @@ impl Db {
         Ok(())
     }
 
-    /// 写入一批同步结果；返回 (新任务, 有更新的任务)。不在本次结果中的任务移出收件箱。
-    pub fn apply_sync(&self, issues: &[Issue]) -> Result<(Vec<u64>, Vec<u64>, usize)> {
+    /// 写入一批同步结果，返回新任务和有更新任务的旧状态。不在本次结果中的任务移出收件箱。
+    pub fn apply_sync(&self, issues: &[Issue]) -> Result<SyncDiff> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let now = now_rfc3339();
-        let mut new_ids = Vec::new();
-        let mut updated_ids = Vec::new();
+        let mut diff = SyncDiff::default();
         for is in issues {
-            let prev: Option<(String, bool)> = tx
+            let prev: Option<PrevIssue> = tx
                 .query_row(
-                    "SELECT updated_on, in_inbox FROM issues WHERE id = ?1",
+                    "SELECT updated_on, in_inbox, status_id, priority_id, due_date FROM issues WHERE id = ?1",
                     [is.id],
-                    |r| Ok((r.get(0)?, r.get::<_, i64>(1)? == 1)),
+                    |r| {
+                        Ok(PrevIssue {
+                            id: is.id,
+                            updated_on: r.get(0)?,
+                            in_inbox: r.get::<_, i64>(1)? == 1,
+                            status_id: r.get(2)?,
+                            priority_id: r.get(3)?,
+                            due_date: r.get(4)?,
+                        })
+                    },
                 )
                 .optional()?;
-            match &prev {
-                None => new_ids.push(is.id),
-                Some((u, in_inbox)) if u != &is.updated_on || !in_inbox => updated_ids.push(is.id),
+            match prev {
+                None => diff.new_ids.push(is.id),
+                Some(p) if p.updated_on != is.updated_on || !p.in_inbox => diff.updated.push(p),
                 _ => {}
             }
             tx.execute(
@@ -195,7 +246,7 @@ impl Db {
             )?;
         }
         let ids: Vec<String> = issues.iter().map(|i| i.id.to_string()).collect();
-        let removed = if ids.is_empty() {
+        diff.removed = if ids.is_empty() {
             tx.execute("UPDATE issues SET in_inbox = 0 WHERE in_inbox = 1", [])?
         } else {
             tx.execute(
@@ -204,7 +255,39 @@ impl Db {
             )?
         };
         tx.commit()?;
-        Ok((new_ids, updated_ids, removed))
+        Ok(diff)
+    }
+
+    /// 自己通过 RedPilot 修改任务后，用最新数据更新本地缓存并标记已读。
+    /// 这样下次同步不会把自己的修改当成新变化，AI 分析也不会因此被标记为过期。
+    pub fn apply_own_update(&self, is: &Issue) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let old: Option<String> = tx
+            .query_row("SELECT updated_on FROM issues WHERE id = ?1", [is.id], |r| r.get(0))
+            .optional()?;
+        let Some(old) = old else { return Ok(()) };
+        tx.execute(
+            "UPDATE issues SET status_id = ?2, status_name = ?3, assigned_to_id = ?4, assigned_to_name = ?5,
+                done_ratio = ?6, updated_on = ?7, read_updated_on = ?7, detail_json = ?8, detail_updated_on = ?7
+             WHERE id = ?1",
+            params![
+                is.id,
+                is.status.id,
+                is.status.name,
+                is.assigned_to.as_ref().map(|a| a.id),
+                is.assigned_to.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                is.done_ratio.unwrap_or(0),
+                is.updated_on,
+                serde_json::to_string(is)?,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE analyses SET ai_issue_updated_on = ?2 WHERE issue_id = ?1 AND ai_issue_updated_on = ?3",
+            params![is.id, is.updated_on, old],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_out_of_inbox(&self, id: u64) -> Result<()> {
@@ -213,8 +296,55 @@ impl Db {
     }
 
     pub fn mark_read(&self, id: u64) -> Result<()> {
-        self.lock().execute("UPDATE issues SET read_updated_on = updated_on WHERE id = ?1", [id])?;
+        self.lock()
+            .execute("UPDATE issues SET read_updated_on = updated_on, change_hint = NULL WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    pub fn set_change_hint(&self, id: u64, hint: &str) -> Result<()> {
+        self.lock()
+            .execute("UPDATE issues SET change_hint = ?2 WHERE id = ?1", params![id, hint])?;
+        Ok(())
+    }
+
+    pub fn add_changes(&self, changes: &[IssueChange]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_rfc3339();
+        for c in changes {
+            tx.execute(
+                "INSERT INTO issue_changes(issue_id, kind, actor, by_author, important, summary, created_on, detected_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![c.issue_id, c.kind, c.actor, c.by_author, c.important, c.summary, c.created_on, now],
+            )?;
+        }
+        // 只保留最近 90 天
+        let cutoff = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        tx.execute("DELETE FROM issue_changes WHERE detected_at < ?1", [cutoff])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn recent_changes(&self, limit: usize) -> Result<Vec<IssueChange>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.issue_id, COALESCE(i.subject, ''), c.kind, c.actor, c.by_author, c.important, c.summary, c.created_on
+             FROM issue_changes c LEFT JOIN issues i ON i.id = c.issue_id
+             ORDER BY c.created_on DESC, c.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(IssueChange {
+                issue_id: r.get(0)?,
+                subject: r.get(1)?,
+                kind: r.get(2)?,
+                actor: r.get(3)?,
+                by_author: r.get(4)?,
+                important: r.get(5)?,
+                summary: r.get(6)?,
+                created_on: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn save_detail(&self, issue: &Issue) -> Result<()> {
@@ -421,13 +551,14 @@ impl Db {
         Ok(())
     }
 
-    pub fn tokens_since(&self, since: &str) -> Result<u64> {
-        let n: i64 = self.lock().query_row(
-            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) FROM ai_usage WHERE created_at >= ?1",
+    /// 某时间之后的 AI 用量：(输入 token, 输出 token)
+    pub fn usage_since(&self, since: &str) -> Result<(u64, u64)> {
+        let (p, c): (i64, i64) = self.lock().query_row(
+            "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0) FROM ai_usage WHERE created_at >= ?1",
             [since],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(n as u64)
+        Ok((p as u64, c as u64))
     }
 
     /// 最近 N 天每天的回派数量（按本地日期）
@@ -501,6 +632,7 @@ fn row_to_view(r: &Row) -> rusqlite::Result<IssueView> {
         in_inbox: r.get::<_, i64>(18)? == 1,
         unread: read_updated_on.as_deref() != Some(updated_on.as_str()),
         overdue,
+        change_hint: r.get(33)?,
         analysis: Analysis {
             category,
             category_source: source.map(str::to_string),

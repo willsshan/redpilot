@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Sparkles,
   Timer,
+  X,
 } from "lucide-react";
 import { api, errorText, type IssueDetail as Detail, type Journal } from "../lib/api";
 import { useApp } from "../lib/store";
@@ -42,12 +43,15 @@ export function IssueDetail({
   onRefresh,
   onResolve,
   onFollowUp,
+  onClose,
 }: {
   detail: Detail | null;
   loading: boolean;
   onRefresh: () => void;
   onResolve: () => void;
   onFollowUp: () => void;
+  /** 在看板抽屉中显示时提供关闭按钮 */
+  onClose?: () => void;
 }) {
   const { config } = useApp();
   const toast = useToast();
@@ -108,6 +112,11 @@ export function IssueDetail({
             <IconButton title="在浏览器中打开" onClick={() => void api.openUrl(detail.webUrl)}>
               <ExternalLink className="size-3.5" />
             </IconButton>
+            {onClose && (
+              <IconButton title="关闭 (Esc)" onClick={onClose}>
+                <X className="size-4" />
+              </IconButton>
+            )}
           </div>
           <h1 className="selectable text-[20px] leading-snug font-semibold tracking-tight text-ink">{v.subject}</h1>
 
