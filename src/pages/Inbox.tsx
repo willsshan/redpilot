@@ -35,6 +35,7 @@ export function InboxPage() {
   const toast = useToast();
   const [issues, setIssues] = useState<IssueView[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [keyword, setKeyword] = useState("");
   const [category, setCategory] = useState<string | null>(null);
   const [quick, setQuick] = useState<Quick>("all");
@@ -73,6 +74,9 @@ export function InboxPage() {
   const load = useCallback(async () => {
     try {
       setIssues(await api.listIssues({ keyword: keyword || null }));
+      setLoadError(null);
+    } catch (e) {
+      setLoadError(errorText(e));
     } finally {
       setLoaded(true);
     }
@@ -357,7 +361,9 @@ export function InboxPage() {
 
       {view === "board" ? (
         <div className="relative min-h-0 flex-1">
-          {loaded && issues.length === 0 ? (
+          {loadError ? (
+            <Empty icon={<X className="size-6" />} title="无法读取本地任务列表" desc={loadError} action={<Button onClick={() => void load()}>重试</Button>} />
+          ) : loaded && issues.length === 0 ? (
             <Empty icon={<InboxIcon className="size-6" />} title="收件箱已清空" desc="当前没有指派给你的未关闭任务，休息一下吧。" />
           ) : (
             <Board
@@ -400,6 +406,13 @@ export function InboxPage() {
                 <div key={i} className="skeleton h-[86px]" />
               ))}
             </div>
+          ) : loadError ? (
+            <Empty
+              icon={<X className="size-6" />}
+              title="无法读取本地任务列表"
+              desc={loadError}
+              action={<Button onClick={() => void load()}>重试</Button>}
+            />
           ) : visible.length === 0 ? (
             <Empty
               icon={<InboxIcon className="size-6" />}

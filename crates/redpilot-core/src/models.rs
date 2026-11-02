@@ -222,7 +222,7 @@ pub struct SimilarIssue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct IssueFilter {
     /// 默认只看收件箱（当前仍需我处理的任务）
     pub include_done: bool,
@@ -388,4 +388,22 @@ pub struct ResolutionRecord {
     pub spent_hours: Option<f64>,
     pub created_at: String,
     pub via: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 前端只传需要的字段，其余字段必须有默认值，否则整个请求会失败
+    #[test]
+    fn filter_accepts_partial_json_from_frontend() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({ "keyword": null }),
+            serde_json::json!({ "includeDone": true }),
+        ] {
+            let f: IssueFilter = serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{v} 解析失败: {e}"));
+            assert!(f.keyword.is_none() && !f.unread_only);
+        }
+    }
 }
