@@ -317,7 +317,7 @@ export function IssueDetail({
           追问提出人
         </Button>
         <Button variant="primary" size="lg" icon={<CornerUpLeft className="size-4" />} onClick={onResolve}>
-          处理完成 · 回派给 {v.authorName || "提出人"}
+          处理 · 回派给 {v.authorName || "提出人"}
           <Kbd>R</Kbd>
         </Button>
       </div>

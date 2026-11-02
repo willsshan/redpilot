@@ -11,7 +11,7 @@
 ![Rust](https://img.shields.io/badge/Rust-Tauri%202-orange?logo=rust)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
-![MCP](https://img.shields.io/badge/MCP-20%20tools-8e4ec6)
+![MCP](https://img.shields.io/badge/MCP-21%20tools-8e4ec6)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -58,6 +58,7 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 ### ↩️ 一键回派
 - 写几句处理要点，由 **AI 扩写成处置说明**（问题原因 / 处理方法 / 处理结果 / 影响范围 / 验证建议）
 - 点一下同时完成：写入说明、切换状态、**指派回提出人**、完成度 100%、登记工时
+- 指派对象默认是提出人，也可以转给项目里的其他成员或组，或保持不变（只写备注）
 - **附件**：粘贴截图会自动作为附件插入说明，也可以选择或拖入文件；批量回派时分别上传到每个任务
 - 合并处理的任务可以批量回派；提交后 5 秒内可以撤销
 - 能识别提出人不可指派、提出人是自己、工作流不允许该状态等情况，给出明确提示
@@ -153,7 +154,7 @@ claude mcp add --transport http redpilot http://127.0.0.1:39217/mcp \
 
 | 类型 | 工具 |
 |---|---|
-| 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_recent_changes` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `draft_resolution_note` · `set_classification` · `work_report` |
+| 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_recent_changes` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `list_assignees` · `draft_resolution_note` · `set_classification` · `work_report` |
 | 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
 
 写操作会直接修改 Redmine 并通知相关人员，需要在设置中手动开启“允许外部 AI 执行写操作”。通过 MCP 上传附件时，隐藏目录和 RedPilot 数据目录中的文件会被拒绝。

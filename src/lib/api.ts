@@ -165,12 +165,21 @@ export interface ResolveRequest {
   notes: string;
   statusId?: number | null;
   assignToAuthor: boolean;
+  /** 指派给指定成员，优先于 assignToAuthor */
+  assignToId?: number | null;
   doneRatio?: number | null;
   spentHours?: number | null;
   activityId?: number | null;
   privateNotes: boolean;
   /** 暂存附件的本地路径 */
   attachments: string[];
+}
+
+export interface Assignee {
+  id: number;
+  name: string;
+  isGroup: boolean;
+  roles: string[];
 }
 
 export interface StagedFile {
@@ -326,6 +335,7 @@ export const api = {
     invoke<StagedFile>("stage_attachment", new Uint8Array(await file.arrayBuffer()), {
       headers: { "x-filename": encodeURIComponent(filename) },
     }),
+  assignees: (projectId: number) => invoke<Assignee[]>("assignees", { projectId }),
   recentChanges: (limit = 30) => invoke<IssueChange[]>("recent_changes", { limit }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),

@@ -104,6 +104,7 @@ pub fn run() {
             commands::stage_attachment,
             commands::recent_changes,
             commands::attachment_bytes,
+            commands::assignees,
             commands::get_autostart,
             commands::set_autostart,
             commands::statuses,

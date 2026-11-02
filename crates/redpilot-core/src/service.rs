@@ -52,6 +52,8 @@ pub struct Service {
     redmine_client: RwLock<Option<RedmineClient>>,
     me: RwLock<Option<User>>,
     statuses: RwLock<Vec<NamedId>>,
+    /// 项目成员缓存：项目 ID → (获取时间, 成员)
+    assignees: RwLock<HashMap<u64, (std::time::Instant, Vec<Assignee>)>>,
     sync_lock: AsyncMutex<()>,
     events: broadcast::Sender<AppEvent>,
 }
@@ -80,6 +82,7 @@ impl Service {
             redmine_client: RwLock::new(None),
             me: RwLock::new(None),
             statuses: RwLock::new(Vec::new()),
+            assignees: RwLock::new(HashMap::new()),
             sync_lock: AsyncMutex::new(()),
             events,
         }))
@@ -151,6 +154,7 @@ impl Service {
         write(&self.redmine_client, None);
         write(&self.me, None);
         write(&self.statuses, Vec::new());
+        write(&self.assignees, HashMap::new());
     }
 
     pub fn secret(&self, kind: SecretKind) -> Result<Option<String>> {
@@ -263,6 +267,38 @@ impl Service {
         let s = self.redmine()?.statuses().await?;
         write(&self.statuses, s.clone());
         Ok(s)
+    }
+
+    /// 项目中可指派的成员（缓存 10 分钟）。没有权限查看成员时返回空列表。
+    pub async fn assignees(&self, project_id: u64) -> Result<Vec<Assignee>> {
+        if let Some((at, list)) = self.assignees.read().unwrap_or_else(|e| e.into_inner()).get(&project_id) {
+            if at.elapsed() < Duration::from_secs(600) {
+                return Ok(list.clone());
+            }
+        }
+        let mut list = match self.redmine()?.memberships(project_id).await {
+            Ok(l) => l,
+            Err(e) if e.to_string().contains("REDMINE_FORBIDDEN") || e.to_string().contains("REDMINE_NOT_FOUND") => {
+                tracing::info!("无法读取项目 {project_id} 的成员: {e}");
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+        list.sort_by(|a, b| a.is_group.cmp(&b.is_group).then_with(|| a.name.cmp(&b.name)));
+        self.assignees
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(project_id, (std::time::Instant::now(), list.clone()));
+        Ok(list)
+    }
+
+    /// 任务所属项目的可指派成员
+    pub async fn assignees_for_issue(&self, issue_id: u64) -> Result<Vec<Assignee>> {
+        let project_id = match self.db.get_view(issue_id)? {
+            Some(v) => v.project_id,
+            None => self.detail(issue_id, false).await?.project.id,
+        };
+        self.assignees(project_id).await
     }
 
     pub async fn activities(&self) -> Result<Vec<NamedId>> {
@@ -831,6 +867,7 @@ impl Service {
                     notes: Some(req.notes.clone()),
                     status_id,
                     assign_to_author: req.assign_to_author,
+                    assign_to: req.assign_to_id,
                     done_ratio,
                     private_notes: req.private_notes,
                     files,
@@ -846,6 +883,11 @@ impl Service {
             if let Err(e) = self.redmine()?.create_time_entry(req.issue_id, h, activity, comment).await {
                 out.warnings.push(format!("处置已提交，但工时登记失败：{e}"));
             }
+        }
+        // 只写备注、不改状态也不改指派时，不算一次回派
+        if status_id.is_none() && req.assign_to_id.is_none() && !req.assign_to_author {
+            self.emit(AppEvent::IssuesChanged);
+            return Ok(out);
         }
         let subject = self.db.get_view(req.issue_id)?.map(|v| v.subject).unwrap_or_default();
         self.db.add_resolution(&ResolutionRecord {
@@ -994,7 +1036,7 @@ impl Service {
     }
 
     async fn apply_update(&self, id: u64, plan: UpdatePlan) -> Result<ResolveOutcome> {
-        let UpdatePlan { notes, status_id, assign_to_author, done_ratio, private_notes, files } = plan;
+        let UpdatePlan { notes, status_id, assign_to_author, assign_to, done_ratio, private_notes, files } = plan;
         let rm = self.redmine()?;
         let issue = rm.get_issue(id).await?;
         let me = self.me().await.ok();
@@ -1012,7 +1054,23 @@ impl Service {
         }
 
         let mut assignee: Option<NamedId> = None;
-        if assign_to_author {
+        if let Some(uid) = assign_to {
+            let name = if issue.author.as_ref().is_some_and(|a| a.id == uid) {
+                issue.author.as_ref().map(|a| a.name.clone())
+            } else if me.as_ref().is_some_and(|m| m.id == uid) {
+                me.as_ref().map(|m| m.display_name())
+            } else {
+                self.assignees(issue.project.id)
+                    .await
+                    .ok()
+                    .and_then(|l| l.into_iter().find(|a| a.id == uid).map(|a| a.name))
+            };
+            assignee = Some(NamedId {
+                id: uid,
+                name: name.unwrap_or_else(|| format!("用户 #{uid}")),
+                is_closed: None,
+            });
+        } else if assign_to_author {
             match &issue.author {
                 None => warnings.push("任务缺少提出人信息，未修改指派".into()),
                 Some(a) if is_anonymous(a) => warnings.push("提出人为匿名用户，无法指派，请手动处理".into()),
@@ -1050,7 +1108,8 @@ impl Service {
             Ok(fresh) => self.db.apply_own_update(&fresh)?,
             Err(e) => tracing::warn!("刷新 #{id} 失败: {e}"),
         }
-        if assignee.is_some() || target.is_some_and(|t| t.is_closed == Some(true)) {
+        let handed_off = assignee.as_ref().is_some_and(|a| me.as_ref().is_none_or(|m| m.id != a.id));
+        if handed_off || target.is_some_and(|t| t.is_closed == Some(true)) {
             self.db.set_out_of_inbox(id)?;
         }
         let status = match status_id {
@@ -1150,6 +1209,8 @@ struct UpdatePlan {
     notes: Option<String>,
     status_id: Option<u64>,
     assign_to_author: bool,
+    /// 指派给指定成员，优先于 assign_to_author
+    assign_to: Option<u64>,
     done_ratio: Option<u32>,
     private_notes: bool,
     files: Vec<PathBuf>,

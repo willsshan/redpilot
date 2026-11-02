@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, CornerUpLeft, FileText, Sparkles, Wand2 } from "lucide-react";
-import { api, errorCode, errorText, type IssueView, type NamedId, type ResolveRequest } from "../lib/api";
+import { api, errorCode, errorText, type Assignee, type IssueView, type NamedId, type ResolveRequest } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { modKey, noteTemplate } from "../lib/format";
@@ -29,7 +29,9 @@ export function ResolveDialog({
   const [statuses, setStatuses] = useState<NamedId[]>([]);
   const [activities, setActivities] = useState<NamedId[]>([]);
   const [statusId, setStatusId] = useState<number | null>(null);
-  const [assignBack, setAssignBack] = useState(true);
+  /** 指派对象：提出人（默认）、保持不变，或指定成员 ID */
+  const [target, setTarget] = useState<"author" | "keep" | number>("author");
+  const [members, setMembers] = useState<Assignee[]>([]);
   const [doneRatio, setDoneRatio] = useState(true);
   const [hours, setHours] = useState("");
   const [activityId, setActivityId] = useState<number | null>(null);
@@ -45,7 +47,11 @@ export function ResolveDialog({
     setPoints("");
     setNotes("");
     setStatusId(config.workflow.resolvedStatusId ?? null);
-    setAssignBack(true);
+    setTarget("author");
+    setMembers([]);
+    // 合并处理的任务属于同一个项目时，才能统一指派给某个成员
+    const projectIds = [...new Set(issues.map((i) => i.projectId))];
+    if (projectIds.length === 1) api.assignees(projectIds[0]).then(setMembers).catch(() => setMembers([]));
     setDoneRatio(config.workflow.setDoneRatio);
     setActivityId(config.workflow.defaultActivityId ?? null);
     setPrivateNotes(false);
@@ -84,7 +90,8 @@ export function ResolveDialog({
     const base = {
       notes,
       statusId,
-      assignToAuthor: assignBack,
+      assignToAuthor: target === "author",
+      assignToId: typeof target === "number" ? target : null,
       doneRatio: doneRatio ? 100 : null,
       spentHours: Number.isFinite(h) && h > 0 ? h : null,
       activityId,
@@ -94,8 +101,8 @@ export function ResolveDialog({
     const reqs: ResolveRequest[] = issues.map((i) => ({ ...base, issueId: i.id }));
     onClose();
 
-    const who = batch ? `${issues.length} 个任务` : `#${issues[0].id} 给 ${issues[0].authorName || "提出人"}`;
-    toast.withUndo(`正在回派 ${who}`, async () => {
+    const who = batch ? `${issues.length} 个任务` : `#${issues[0].id}`;
+    toast.withUndo(target === "keep" ? `正在提交 ${who}` : `正在提交 ${who} 并指派给 ${targetLabel}`, async () => {
       if (batch) {
         const outs = await api.batchResolve(reqs);
         const ok = outs.filter((o) => o.ok);
@@ -103,7 +110,7 @@ export function ResolveDialog({
         ok.forEach((o) => clearTimer(o.issueId));
         toast.show({
           tone: failed.length ? "warn" : "success",
-          title: `已回派 ${ok.length} 个任务${failed.length ? `，${failed.length} 个失败` : ""}`,
+          title: `已处理 ${ok.length} 个任务${failed.length ? `，${failed.length} 个失败` : ""}`,
           body: failed.map((f) => `#${f.issueId}：${errorText(f.error)}`).join("\n") || undefined,
         });
         return;
@@ -118,7 +125,7 @@ export function ResolveDialog({
       clearTimer(req.issueId);
       toast.show({
         tone: out.warnings.length ? "warn" : "success",
-        title: `#${req.issueId} 已回派${out.assignedTo ? `给 ${out.assignedTo}` : ""}`,
+        title: req.assignToAuthor || req.assignToId ? `#${req.issueId} 已指派给 ${out.assignedTo ?? "目标成员"}` : `#${req.issueId} 已提交`,
         body: [out.status ? `状态：${out.status}` : "", out.attached.length ? `附件：${out.attached.join("、")}` : "", ...out.warnings]
           .filter(Boolean)
           .join("\n"),
@@ -129,9 +136,9 @@ export function ResolveDialog({
         toast.show(
           {
             tone: "error",
-            title: "无法指派给提出人",
+            title: `无法指派给${req.assignToId ? "该成员" : "提出人"}`,
             body: errorText(e),
-            action: { label: "仅提交说明", onClick: () => void resolveOne({ ...req, assignToAuthor: false }) },
+            action: { label: "仅提交说明", onClick: () => void resolveOne({ ...req, assignToAuthor: false, assignToId: null }) },
           },
           12000,
         );
@@ -154,13 +161,18 @@ export function ResolveDialog({
   });
 
   const authors = [...new Set(issues.map((i) => i.authorName).filter(Boolean))];
+  const member = typeof target === "number" ? members.find((m) => m.id === target) : undefined;
+  const targetLabel =
+    target === "author" ? (batch ? "各自的提出人" : issues[0]?.authorName || "提出人") : target === "keep" ? "（不改指派）" : (member?.name ?? `成员 #${target}`);
+  const users = members.filter((m) => !m.isGroup);
+  const groups = members.filter((m) => m.isGroup);
 
   return (
     <Modal
       open={open}
       onClose={onClose}
       width={920}
-      title={batch ? `批量处理完成 · ${issues.length} 个任务` : "处理完成 · 回派给提出人"}
+      title={batch ? `批量处理 · ${issues.length} 个任务` : "处理任务"}
       subtitle={batch ? issues.map((i) => `#${i.id}`).join("  ") : `#${issues[0]?.id} ${issues[0]?.subject ?? ""}`}
       footer={
         <>
@@ -169,7 +181,7 @@ export function ResolveDialog({
             取消
           </Button>
           <Button variant="primary" icon={<CornerUpLeft className="size-4" />} onClick={submit}>
-            提交并回派 <span className="opacity-70">{modKey}↵</span>
+            {target === "keep" ? "提交" : `提交并指派给 ${targetLabel}`} <span className="opacity-70">{modKey}↵</span>
           </Button>
         </>
       }
@@ -231,27 +243,73 @@ export function ResolveDialog({
           <div className="text-[12px] font-semibold tracking-wide text-ink-3">将执行的操作</div>
 
           <div className="space-y-2 rounded-xl border border-line bg-panel p-3">
-            <div className="flex items-center justify-between">
-              <span className="text-[13px] font-medium">指派回提出人</span>
-              <Switch checked={assignBack} onChange={setAssignBack} />
-            </div>
-            {assignBack && (
+            <div className="text-[13px] font-medium">指派给</div>
+            <Select
+              value={String(target)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setTarget(v === "author" || v === "keep" ? v : Number(v));
+              }}
+            >
+              <option value="author">{batch ? "各自的提出人（默认）" : `提出人 · ${issues[0]?.authorName || "未知"}（默认）`}</option>
+              <option value="keep">{batch || !issues[0]?.assignedToName ? "保持不变" : `保持不变（当前：${issues[0].assignedToName}）`}</option>
+              {users.length > 0 && (
+                <optgroup label="项目成员">
+                  {users.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                      {m.roles.length ? `（${m.roles.join("、")}）` : ""}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {groups.length > 0 && (
+                <optgroup label="组">
+                  {groups.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </Select>
+            {target !== "keep" && (
               <div className="flex flex-wrap items-center gap-1.5 text-[12.5px] text-ink-2">
                 <span>我</span>
                 <ArrowRight className="size-3 text-ink-3" />
-                {authors.slice(0, 3).map((a) => (
-                  <span key={a} className="inline-flex items-center gap-1">
-                    <Avatar name={a} size={18} />
-                    {a}
+                {target === "author" ? (
+                  <>
+                    {authors.slice(0, 3).map((a) => (
+                      <span key={a} className="inline-flex items-center gap-1">
+                        <Avatar name={a} size={18} />
+                        {a}
+                      </span>
+                    ))}
+                    {authors.length > 3 && <span>等 {authors.length} 人</span>}
+                  </>
+                ) : (
+                  <span className="inline-flex items-center gap-1">
+                    <Avatar name={targetLabel} size={18} />
+                    {targetLabel}
                   </span>
-                ))}
-                {authors.length > 3 && <span>等 {authors.length} 人</span>}
+                )}
               </div>
+            )}
+            {batch && members.length === 0 && new Set(issues.map((i) => i.projectId)).size > 1 && (
+              <div className="text-[11.5px] leading-snug text-ink-3">所选任务属于不同项目，只能回派给各自的提出人或保持不变</div>
             )}
           </div>
 
           <Field label="切换状态" hint={!statusId ? "未选择时不修改状态；可在设置中配置默认值" : undefined}>
-            <Select value={statusId ?? ""} onChange={(e) => setStatusId(e.target.value ? Number(e.target.value) : null)}>
+            <Select
+              value={statusId ?? ""}
+              onChange={(e) => {
+                const v = e.target.value ? Number(e.target.value) : null;
+                setStatusId(v);
+                // 不改状态时（比如只是转给别人），默认不把完成度改成 100%
+                setDoneRatio(v === null ? false : (config?.workflow.setDoneRatio ?? true));
+              }}
+            >
               <option value="">不修改</option>
               {statusOptions.map((s) => (
                 <option key={s.id} value={s.id}>

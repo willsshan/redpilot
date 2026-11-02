@@ -308,9 +308,12 @@ pub struct ResolveRequest {
     /// 目标状态，留空使用配置里的“处理完成状态”
     #[serde(default)]
     pub status_id: Option<u64>,
-    /// 指派回提出人（默认 true）
+    /// 指派回提出人（默认 true）；设置了 assign_to_id 时以 assign_to_id 为准
     #[serde(default = "default_true")]
     pub assign_to_author: bool,
+    /// 指派给指定的项目成员（用户或组 ID）
+    #[serde(default)]
+    pub assign_to_id: Option<u64>,
     #[serde(default)]
     pub done_ratio: Option<u32>,
     /// 同时登记工时（小时）
@@ -340,6 +343,16 @@ pub struct ResolveOutcome {
     pub attached: Vec<String>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+}
+
+/// 可指派的项目成员
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Assignee {
+    pub id: u64,
+    pub name: String,
+    pub is_group: bool,
+    pub roles: Vec<String>,
 }
 
 /// 已暂存、等待随回派上传的附件

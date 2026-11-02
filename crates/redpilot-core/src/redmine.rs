@@ -1,7 +1,7 @@
 //! Redmine REST API 客户端。需管理员在“管理 → 配置 → API”中启用 REST web service。
 
 use crate::config::RedmineConfig;
-use crate::models::{Issue, NamedId, Project, User};
+use crate::models::{Assignee, Issue, NamedId, Project, User};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -293,6 +293,60 @@ impl RedmineClient {
         Ok(())
     }
 
+    /// 项目成员（用户和组），作为指派候选
+    pub async fn memberships(&self, project_id: u64) -> Result<Vec<Assignee>> {
+        #[derive(Deserialize)]
+        struct M {
+            #[serde(default)]
+            user: Option<NamedId>,
+            #[serde(default)]
+            group: Option<NamedId>,
+            #[serde(default)]
+            roles: Vec<NamedId>,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            memberships: Vec<M>,
+            #[serde(default)]
+            total_count: usize,
+        }
+        let mut out: Vec<Assignee> = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page: Page = self
+                .get(
+                    &format!("/projects/{project_id}/memberships.json"),
+                    &[("limit", "100".into()), ("offset", offset.to_string())],
+                )
+                .await?;
+            let n = page.memberships.len();
+            for m in page.memberships {
+                let (who, is_group) = match (m.user, m.group) {
+                    (Some(u), _) => (u, false),
+                    (None, Some(g)) => (g, true),
+                    _ => continue,
+                };
+                let roles: Vec<String> = m.roles.into_iter().map(|r| r.name).collect();
+                // 通过组继承角色的用户会重复出现，合并角色
+                match out.iter_mut().find(|a| a.id == who.id) {
+                    Some(a) => {
+                        for r in roles {
+                            if !a.roles.contains(&r) {
+                                a.roles.push(r);
+                            }
+                        }
+                    }
+                    None => out.push(Assignee { id: who.id, name: who.name, is_group, roles }),
+                }
+            }
+            offset += n;
+            if n == 0 || offset >= page.total_count || offset >= 2000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn statuses(&self) -> Result<Vec<NamedId>> {
         #[derive(Deserialize)]
         struct W {
@@ -336,7 +390,7 @@ fn map_error(status: StatusCode, body: &str) -> anyhow::Error {
         StatusCode::UNPROCESSABLE_ENTITY => {
             let lower = detail.to_lowercase();
             if lower.contains("assignee") || detail.contains("指派") {
-                crate::coded("ASSIGNEE_INVALID", format!("无法指派给提出人（可能不是项目成员或其角色不可被指派）：{detail}"))
+                crate::coded("ASSIGNEE_INVALID", format!("无法指派给目标用户（可能不是项目成员，或其角色不允许被指派）：{detail}"))
             } else if lower.contains("status") || detail.contains("状态") {
                 crate::coded("STATUS_INVALID", format!("工作流不允许切换到该状态：{detail}"))
             } else {

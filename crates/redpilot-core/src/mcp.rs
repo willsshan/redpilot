@@ -139,6 +139,9 @@ pub struct ResolveParams {
     /// 是否指派回提出人，默认 true
     #[serde(default)]
     pub assign_to_author: Option<bool>,
+    /// 改为指派给指定成员（用户或组 ID，可用 list_assignees 查询）；设置后忽略 assign_to_author
+    #[serde(default)]
+    pub assign_to_id: Option<u64>,
     /// 完成度（0-100）；留空按用户配置（默认 100）
     #[serde(default)]
     pub done_ratio: Option<u32>,
@@ -161,6 +164,9 @@ pub struct BatchResolveParams {
     /// 每个任务登记的工时（小时）
     #[serde(default)]
     pub spent_hours_each: Option<f64>,
+    /// 全部指派给指定成员；留空则各自指派回提出人
+    #[serde(default)]
+    pub assign_to_id: Option<u64>,
     /// 附件（本机文件绝对路径），会分别上传到每个任务
     #[serde(default)]
     pub attachments: Option<Vec<String>>,
@@ -372,13 +378,19 @@ impl RedPilotMcp {
         }))
     }
 
+    #[tool(description = "列出任务所属项目中可以指派的成员（用户和组），用于把任务转给其他人处理。")]
+    async fn list_assignees(&self, Parameters(p): Parameters<IssueIdParams>) -> ToolResult {
+        self.prepare();
+        to_json(&self.svc.assignees_for_issue(p.issue_id).await.map_err(err)?)
+    }
+
     #[tool(description = "根据处理要点起草规范的处置说明（问题原因/处理方法/处理结果/影响范围/验证建议），只生成不提交。多个任务时生成一份共用说明。")]
     async fn draft_resolution_note(&self, Parameters(p): Parameters<DraftNoteParams>) -> ToolResult {
         self.prepare();
         self.svc.draft_note(&p.issue_ids, &p.key_points).await.map_err(err)
     }
 
-    #[tool(description = "【写操作】处理完成并回派：写入处置说明、切换到完成状态、指派回提出人、可同时登记工时和上传附件。提交前请确保说明内容已经用户确认。")]
+    #[tool(description = "【写操作】处理并指派：写入处置说明、切换到完成状态、默认指派回提出人（也可用 assign_to_id 转给其他成员），可同时登记工时和上传附件。提交前请确保说明内容已经用户确认。")]
     async fn resolve_issue(&self, Parameters(p): Parameters<ResolveParams>) -> ToolResult {
         self.ensure_write()?;
         let req = ResolveRequest {
@@ -386,6 +398,7 @@ impl RedPilotMcp {
             notes: p.notes,
             status_id: p.status_id,
             assign_to_author: p.assign_to_author.unwrap_or(true),
+            assign_to_id: p.assign_to_id,
             done_ratio: p.done_ratio,
             spent_hours: p.spent_hours,
             activity_id: None,
@@ -406,6 +419,7 @@ impl RedPilotMcp {
                 notes: p.notes.clone(),
                 status_id: p.status_id,
                 assign_to_author: true,
+                assign_to_id: p.assign_to_id,
                 done_ratio: None,
                 spent_hours: p.spent_hours_each,
                 activity_id: None,
