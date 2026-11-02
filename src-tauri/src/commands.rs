@@ -239,6 +239,31 @@ pub async fn assignees(state: State<'_, AppState>, project_id: u64) -> CmdResult
 }
 
 #[tauri::command]
+pub async fn my_projects(state: State<'_, AppState>) -> CmdResult<Vec<ProjectAccess>> {
+    state.svc.my_projects().await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn project_overview(state: State<'_, AppState>, project_id: u64, refresh: bool) -> CmdResult<ProjectOverview> {
+    state.svc.project_overview(project_id, refresh).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn suggest_assignments(
+    state: State<'_, AppState>,
+    project_id: u64,
+    issue_ids: Vec<u64>,
+    use_ai: bool,
+) -> CmdResult<Vec<AssignSuggestion>> {
+    state.svc.suggest_assignments(project_id, &issue_ids, use_ai).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn bulk_assign(state: State<'_, AppState>, items: Vec<AssignItem>, notes: Option<String>) -> CmdResult<Vec<ResolveOutcome>> {
+    Ok(state.svc.bulk_assign(&items, notes).await)
+}
+
+#[tauri::command]
 pub fn recent_changes(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec<IssueChange>> {
     state.svc.recent_changes(limit).map_err(e)
 }

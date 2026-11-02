@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useState, type React
 import { api, onAppEvent, type AppConfig, type McpStatus, type SecretStatus, type Stats } from "./api";
 import { useToast } from "./toast";
 
-export type Page = "inbox" | "plan" | "dashboard" | "settings";
+export type Page = "inbox" | "project" | "plan" | "dashboard" | "settings";
 
 /** 命令面板等处发给页面的指令，由对应页面执行后清除 */
 export type Intent =
@@ -49,7 +49,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // 支持 ?page=settings 直接打开指定页面
   const [page, setPage] = useState<Page>(() => {
     const p = new URLSearchParams(window.location.search).get("page");
-    return p === "plan" || p === "dashboard" || p === "settings" ? p : "inbox";
+    return p === "project" || p === "plan" || p === "dashboard" || p === "settings" ? p : "inbox";
   });
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [secrets, setSecrets] = useState<SecretStatus>({ redmine: false, ai: false });

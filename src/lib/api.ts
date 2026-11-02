@@ -182,6 +182,66 @@ export interface Assignee {
   roles: string[];
 }
 
+export interface ProjectAccess {
+  id: number;
+  name: string;
+  roles: string[];
+  isManager: boolean;
+}
+
+export interface ProjectIssue {
+  id: number;
+  projectName: string;
+  subject: string;
+  description: string;
+  tracker: string;
+  status: string;
+  priorityId: number;
+  priority: string;
+  authorId?: number | null;
+  author: string;
+  assigneeId?: number | null;
+  assignee: string;
+  categoryId?: number | null;
+  category?: string | null;
+  versionId?: number | null;
+  version?: string | null;
+  doneRatio: number;
+  dueDate?: string | null;
+  createdOn: string;
+  updatedOn: string;
+  overdue: boolean;
+  staleDays: number;
+}
+
+export interface VersionProgress {
+  id: number;
+  name: string;
+  status: string;
+  dueDate?: string | null;
+  open: number;
+  closed: number;
+  overdue: boolean;
+}
+
+export interface ProjectOverview {
+  projectId: number;
+  fetchedAt: string;
+  issues: ProjectIssue[];
+  truncated: boolean;
+  members: Assignee[];
+  versions: VersionProgress[];
+  weekly: { label: string; created: number; closed: number }[];
+}
+
+export interface AssignSuggestion {
+  issueId: number;
+  assigneeId?: number | null;
+  assigneeName: string;
+  reason: string;
+  source: "ai" | "category" | "history" | "workload";
+}
+
 export interface StagedFile {
   path: string;
   filename: string;
@@ -336,6 +396,12 @@ export const api = {
       headers: { "x-filename": encodeURIComponent(filename) },
     }),
   assignees: (projectId: number) => invoke<Assignee[]>("assignees", { projectId }),
+  myProjects: () => invoke<ProjectAccess[]>("my_projects"),
+  projectOverview: (projectId: number, refresh = false) => invoke<ProjectOverview>("project_overview", { projectId, refresh }),
+  suggestAssignments: (projectId: number, issueIds: number[], useAi: boolean) =>
+    invoke<AssignSuggestion[]>("suggest_assignments", { projectId, issueIds, useAi }),
+  bulkAssign: (items: { issueId: number; assigneeId: number }[], notes: string | null) =>
+    invoke<ResolveOutcome[]>("bulk_assign", { items, notes }),
   recentChanges: (limit = 30) => invoke<IssueChange[]>("recent_changes", { limit }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),

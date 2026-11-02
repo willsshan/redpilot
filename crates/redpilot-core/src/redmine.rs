@@ -1,7 +1,7 @@
 //! Redmine REST API 客户端。需管理员在“管理 → 配置 → API”中启用 REST web service。
 
 use crate::config::RedmineConfig;
-use crate::models::{Assignee, Issue, NamedId, Project, User};
+use crate::models::{Assignee, Issue, NamedId, Project, ProjectAccess, User};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -26,6 +26,30 @@ pub struct IssueQuery {
     /// open | closed | * | 具体状态 ID
     pub status: String,
     pub updated_since: Option<String>,
+    /// 其他筛选参数，如 `closed_on`
+    pub extra: Vec<(&'static str, String)>,
+    /// 最多拉取多少条，0 表示默认上限 2000
+    pub max_results: usize,
+}
+
+/// Redmine 版本（里程碑）
+#[derive(Debug, Clone, Deserialize)]
+pub struct Version {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub due_date: Option<String>,
+}
+
+/// 任务类别，可设置默认负责人
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueCategory {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub assigned_to: Option<NamedId>,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +166,8 @@ impl RedmineClient {
         if let Some(since) = &q.updated_since {
             params.push(("updated_on", format!(">={since}")));
         }
+        params.extend(q.extra.iter().cloned());
+        let cap = if q.max_results == 0 { 2000 } else { q.max_results.min(2000) };
         let mut all = Vec::new();
         let mut offset = 0usize;
         loop {
@@ -152,11 +178,83 @@ impl RedmineClient {
             all.extend(page.issues);
             offset += n;
             // 上限保护，避免误配查询拉取整个库
-            if n == 0 || offset >= page.total_count || offset >= 2000 {
+            if n == 0 || offset >= page.total_count || offset >= cap {
                 break;
             }
         }
+        all.truncate(cap);
         Ok(all)
+    }
+
+    /// 只取符合条件的任务数量
+    pub async fn count_issues(&self, params: &[(&str, String)]) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct Page {
+            #[serde(default)]
+            total_count: usize,
+        }
+        let mut p: Vec<(&str, String)> = params.to_vec();
+        p.push(("limit", "1".into()));
+        Ok(self.get::<Page>("/issues.json", &p).await?.total_count)
+    }
+
+    /// 我参与的项目和角色；系统管理员可以看到全部项目
+    pub async fn my_projects(&self) -> Result<(bool, Vec<ProjectAccess>)> {
+        #[derive(Deserialize)]
+        struct M {
+            project: NamedId,
+            #[serde(default)]
+            roles: Vec<NamedId>,
+        }
+        #[derive(Deserialize)]
+        struct U {
+            #[serde(default)]
+            admin: bool,
+            #[serde(default)]
+            memberships: Vec<M>,
+        }
+        #[derive(Deserialize)]
+        struct W {
+            user: U,
+        }
+        let u = self
+            .get::<W>("/users/current.json", &[("include", "memberships".into())])
+            .await?
+            .user;
+        let mut out: Vec<ProjectAccess> = Vec::new();
+        for m in u.memberships {
+            let roles: Vec<String> = m.roles.into_iter().map(|r| r.name).collect();
+            match out.iter_mut().find(|p| p.id == m.project.id) {
+                Some(p) => {
+                    for r in roles {
+                        if !p.roles.contains(&r) {
+                            p.roles.push(r);
+                        }
+                    }
+                }
+                None => out.push(ProjectAccess { id: m.project.id, name: m.project.name, roles, is_manager: false }),
+            }
+        }
+        Ok((u.admin, out))
+    }
+
+    pub async fn versions(&self, project_id: u64) -> Result<Vec<Version>> {
+        #[derive(Deserialize)]
+        struct W {
+            versions: Vec<Version>,
+        }
+        Ok(self.get::<W>(&format!("/projects/{project_id}/versions.json"), &[]).await?.versions)
+    }
+
+    pub async fn issue_categories(&self, project_id: u64) -> Result<Vec<IssueCategory>> {
+        #[derive(Deserialize)]
+        struct W {
+            issue_categories: Vec<IssueCategory>,
+        }
+        Ok(self
+            .get::<W>(&format!("/projects/{project_id}/issue_categories.json"), &[])
+            .await?
+            .issue_categories)
     }
 
     pub async fn get_issue(&self, id: u64) -> Result<Issue> {

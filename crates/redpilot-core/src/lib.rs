@@ -7,6 +7,7 @@ pub mod db;
 pub mod mask;
 pub mod mcp;
 pub mod models;
+pub mod project;
 pub mod prompts;
 pub mod redmine;
 pub mod secrets;

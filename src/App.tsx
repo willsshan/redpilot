@@ -5,6 +5,7 @@ import { ToastProvider } from "./lib/toast";
 import { DashboardPage } from "./pages/Dashboard";
 import { InboxPage } from "./pages/Inbox";
 import { PlanPage } from "./pages/Plan";
+import { ProjectPage } from "./pages/Project";
 import { SettingsPage } from "./pages/Settings";
 
 function Shell() {
@@ -14,6 +15,7 @@ function Shell() {
       <Sidebar />
       <main className="min-w-0 flex-1 bg-canvas">
         {page === "inbox" && <InboxPage />}
+        {page === "project" && <ProjectPage />}
         {page === "plan" && <PlanPage />}
         {page === "dashboard" && <DashboardPage />}
         {page === "settings" && <SettingsPage />}

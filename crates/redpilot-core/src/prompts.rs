@@ -66,6 +66,18 @@ pub fn note_system(format: TextFormat, sections: &[String]) -> String {
     )
 }
 
+pub fn assign_system() -> String {
+    r#"你是项目经理的任务分配助手。根据成员的角色、他们当前负责的任务（体现熟悉的模块）和负载，把每个待分配任务分给最合适的人。
+只输出 JSON，格式：
+{"assignments":[{"issueId": 任务ID(数字), "assigneeId": 成员ID(数字), "reason": "30 字以内的理由，说明为什么是他"}]}
+要求：
+- assigneeId 必须来自成员列表，每个待分配任务都要给出结果；
+- 优先分给熟悉相关模块、类别或同类问题的人；类别设置了默认负责人时优先考虑；
+- 能力相当时分给负载更低的人，避免集中到同一个人；
+- 本地算法的推荐只是参考，可以推翻，但要在理由中说明依据。"#
+        .to_string()
+}
+
 pub fn report_system(days: i64) -> String {
     format!(
         r#"你是工程师的周报助手。根据最近 {days} 天的工单处置记录，写一份工作报告（Markdown）：

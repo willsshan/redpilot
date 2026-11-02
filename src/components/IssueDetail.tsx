@@ -46,6 +46,7 @@ export function IssueDetail({
   onResolve,
   onFollowUp,
   onClose,
+  hideAi,
 }: {
   detail: Detail | null;
   loading: boolean;
@@ -54,6 +55,8 @@ export function IssueDetail({
   onFollowUp: () => void;
   /** 在看板抽屉中显示时提供关闭按钮 */
   onClose?: () => void;
+  /** 不在收件箱中的任务（如项目总览）不显示 AI 分析 */
+  hideAi?: boolean;
 }) {
   const { config } = useApp();
   const toast = useToast();
@@ -134,6 +137,7 @@ export function IssueDetail({
           </div>
 
           {/* AI 分析 */}
+          {!hideAi && (
           <div className="ai-card mt-5 rounded-xl p-4 shadow-card">
             <div className="mb-3 flex items-center gap-2">
               <Sparkles className="size-4 text-accent" />
@@ -219,6 +223,7 @@ export function IssueDetail({
               </div>
             )}
           </div>
+          )}
 
           {/* 描述 */}
           <div className="mt-7">

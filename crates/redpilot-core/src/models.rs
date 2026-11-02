@@ -54,6 +54,12 @@ pub struct Issue {
     pub allowed_statuses: Vec<NamedId>,
     #[serde(default)]
     pub watchers: Vec<NamedId>,
+    /// Redmine 的“类别”
+    #[serde(default)]
+    pub category: Option<NamedId>,
+    /// 目标版本（里程碑）
+    #[serde(default, alias = "fixed_version")]
+    pub fixed_version: Option<NamedId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +349,102 @@ pub struct ResolveOutcome {
     pub attached: Vec<String>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+}
+
+/// 我参与的项目及我在其中的角色
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAccess {
+    pub id: u64,
+    pub name: String,
+    pub roles: Vec<String>,
+    /// 担任管理类角色（或是系统管理员）
+    pub is_manager: bool,
+}
+
+/// 项目视角下的任务（不限于指派给我的）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIssue {
+    pub id: u64,
+    pub project_name: String,
+    pub subject: String,
+    pub description: String,
+    pub tracker: String,
+    pub status: String,
+    pub priority_id: u64,
+    pub priority: String,
+    pub author_id: Option<u64>,
+    pub author: String,
+    pub assignee_id: Option<u64>,
+    pub assignee: String,
+    pub category_id: Option<u64>,
+    pub category: Option<String>,
+    pub version_id: Option<u64>,
+    pub version: Option<String>,
+    pub done_ratio: u32,
+    pub due_date: Option<String>,
+    pub created_on: String,
+    pub updated_on: String,
+    pub overdue: bool,
+    /// 距上次更新的天数
+    pub stale_days: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionProgress {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    pub due_date: Option<String>,
+    pub open: usize,
+    pub closed: usize,
+    /// 已过截止日期但还有未关闭任务
+    pub overdue: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeekStat {
+    /// 周一的日期，如 10-27
+    pub label: String,
+    pub created: usize,
+    pub closed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectOverview {
+    pub project_id: u64,
+    pub fetched_at: String,
+    /// 全部未关闭任务（含子项目）
+    pub issues: Vec<ProjectIssue>,
+    /// 未关闭任务超过 2000 个时只取了前 2000 个
+    pub truncated: bool,
+    pub members: Vec<Assignee>,
+    pub versions: Vec<VersionProgress>,
+    /// 近 8 周新增与关闭数量，从早到晚
+    pub weekly: Vec<WeekStat>,
+}
+
+/// 转派建议
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignSuggestion {
+    pub issue_id: u64,
+    pub assignee_id: Option<u64>,
+    pub assignee_name: String,
+    pub reason: String,
+    /// ai | category | history | workload
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignItem {
+    pub issue_id: u64,
+    pub assignee_id: u64,
 }
 
 /// 可指派的项目成员

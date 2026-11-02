@@ -5,7 +5,8 @@ use crate::analysis::{self, Corpus};
 use crate::config::{self, AppConfig, Paths};
 use crate::db::{self, Db, PrevIssue};
 use crate::models::*;
-use crate::redmine::{truncate, IssueQuery, IssueUpdate, RedmineClient};
+use crate::project;
+use crate::redmine::{truncate, IssueCategory, IssueQuery, IssueUpdate, RedmineClient};
 use crate::secrets::{SecretKind, SecretStore};
 use crate::{coded, mask, prompts};
 use anyhow::{anyhow, Context, Result};
@@ -54,6 +55,8 @@ pub struct Service {
     statuses: RwLock<Vec<NamedId>>,
     /// 项目成员缓存：项目 ID → (获取时间, 成员)
     assignees: RwLock<HashMap<u64, (std::time::Instant, Vec<Assignee>)>>,
+    /// 项目总览缓存：项目 ID → (获取时间, 总览)
+    overviews: RwLock<HashMap<u64, (std::time::Instant, ProjectOverview)>>,
     sync_lock: AsyncMutex<()>,
     events: broadcast::Sender<AppEvent>,
 }
@@ -83,6 +86,7 @@ impl Service {
             me: RwLock::new(None),
             statuses: RwLock::new(Vec::new()),
             assignees: RwLock::new(HashMap::new()),
+            overviews: RwLock::new(HashMap::new()),
             sync_lock: AsyncMutex::new(()),
             events,
         }))
@@ -155,6 +159,7 @@ impl Service {
         write(&self.me, None);
         write(&self.statuses, Vec::new());
         write(&self.assignees, HashMap::new());
+        write(&self.overviews, HashMap::new());
     }
 
     pub fn secret(&self, kind: SecretKind) -> Result<Option<String>> {
@@ -1055,15 +1060,15 @@ impl Service {
 
         let mut assignee: Option<NamedId> = None;
         if let Some(uid) = assign_to {
+            // 优先用 Redmine 按其显示格式返回的名字
             let name = if issue.author.as_ref().is_some_and(|a| a.id == uid) {
                 issue.author.as_ref().map(|a| a.name.clone())
-            } else if me.as_ref().is_some_and(|m| m.id == uid) {
-                me.as_ref().map(|m| m.display_name())
             } else {
                 self.assignees(issue.project.id)
                     .await
                     .ok()
                     .and_then(|l| l.into_iter().find(|a| a.id == uid).map(|a| a.name))
+                    .or_else(|| me.as_ref().filter(|m| m.id == uid).map(|m| m.display_name()))
             };
             assignee = Some(NamedId {
                 id: uid,
@@ -1125,6 +1130,324 @@ impl Service {
             warnings,
             error: None,
         })
+    }
+
+    // ---------------- 项目总览（项目管理员视角） ----------------
+
+    /// 我参与的项目，担任管理类角色的排在前面；系统管理员可以看到全部项目
+    pub async fn my_projects(&self) -> Result<Vec<ProjectAccess>> {
+        let rm = self.redmine()?;
+        let (admin, mut list) = rm.my_projects().await?;
+        for p in &mut list {
+            p.is_manager = admin || p.roles.iter().any(|r| project::is_manager_role(r));
+        }
+        if admin {
+            for p in rm.projects().await.unwrap_or_default() {
+                if !list.iter().any(|x| x.id == p.id) {
+                    list.push(ProjectAccess { id: p.id, name: p.name, roles: vec!["系统管理员".into()], is_manager: true });
+                }
+            }
+        }
+        list.sort_by(|a, b| b.is_manager.cmp(&a.is_manager).then_with(|| a.name.cmp(&b.name)));
+        Ok(list)
+    }
+
+    /// 项目全部未关闭任务、版本进度、近 8 周新增/关闭趋势（缓存 5 分钟）
+    pub async fn project_overview(&self, project_id: u64, refresh: bool) -> Result<ProjectOverview> {
+        if !refresh {
+            if let Some((at, ov)) = self.overviews.read().unwrap_or_else(|e| e.into_inner()).get(&project_id) {
+                if at.elapsed() < Duration::from_secs(300) {
+                    return Ok(ov.clone());
+                }
+            }
+        }
+        let rm = self.redmine()?;
+        let today = chrono::Local::now().date_naive();
+        let pid = project_id.to_string();
+        let open = rm
+            .list_issues(&IssueQuery { project: Some(pid.clone()), status: "open".into(), ..Default::default() })
+            .await?;
+        let truncated = open.len() >= 2000;
+        let issues: Vec<ProjectIssue> = open.iter().map(|i| project::to_project_issue(i, today)).collect();
+
+        let mut members = self.assignees(project_id).await.unwrap_or_default();
+        if members.is_empty() {
+            // 没有权限查看成员时，用当前任务的负责人作为候选
+            for i in &issues {
+                if let Some(id) = i.assignee_id {
+                    if !members.iter().any(|m| m.id == id) {
+                        members.push(Assignee { id, name: i.assignee.clone(), is_group: false, roles: vec![] });
+                    }
+                }
+            }
+        }
+
+        let mut versions: Vec<_> = rm
+            .versions(project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| v.status != "closed")
+            .collect();
+        versions.sort_by(|a, b| match (&a.due_date, &b.due_date) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        });
+        versions.truncate(8);
+
+        // 版本已关闭数量、每周新增/关闭数量，都只需要 total_count，并发查询
+        enum Slot {
+            Version(usize),
+            Created(usize),
+            Closed(usize),
+        }
+        let weeks = project::recent_weeks(today, 8);
+        let mut jobs: Vec<(Slot, Vec<(&'static str, String)>)> = Vec::new();
+        for (vi, v) in versions.iter().enumerate() {
+            jobs.push((
+                Slot::Version(vi),
+                vec![("project_id", pid.clone()), ("fixed_version_id", v.id.to_string()), ("status_id", "closed".into())],
+            ));
+        }
+        for (wi, (a, b)) in weeks.iter().enumerate() {
+            jobs.push((Slot::Created(wi), vec![("project_id", pid.clone()), ("status_id", "*".into()), ("created_on", format!("><{a}|{b}"))]));
+            jobs.push((Slot::Closed(wi), vec![("project_id", pid.clone()), ("status_id", "closed".into()), ("closed_on", format!("><{a}|{b}"))]));
+        }
+        let sem = Arc::new(Semaphore::new(4));
+        let mut set = tokio::task::JoinSet::new();
+        for (slot, params) in jobs {
+            let rm = rm.clone();
+            let sem = Arc::clone(&sem);
+            set.spawn(async move {
+                let _permit = sem.acquire().await;
+                let r = rm.count_issues(&params).await;
+                (slot, r)
+            });
+        }
+        let mut closed_by_version = vec![0usize; versions.len()];
+        let mut weekly: Vec<WeekStat> = weeks
+            .iter()
+            .map(|(a, _)| WeekStat { label: a.format("%m-%d").to_string(), created: 0, closed: 0 })
+            .collect();
+        while let Some(joined) = set.join_next().await {
+            let Ok((slot, r)) = joined else { continue };
+            let n = r.unwrap_or_else(|e| {
+                tracing::warn!("统计任务数量失败: {e}");
+                0
+            });
+            match slot {
+                Slot::Version(i) => closed_by_version[i] = n,
+                Slot::Created(i) => weekly[i].created = n,
+                Slot::Closed(i) => weekly[i].closed = n,
+            }
+        }
+        let versions = versions
+            .iter()
+            .enumerate()
+            .map(|(vi, v)| {
+                let open = issues.iter().filter(|i| i.version_id == Some(v.id)).count();
+                VersionProgress {
+                    id: v.id,
+                    name: v.name.clone(),
+                    status: v.status.clone(),
+                    due_date: v.due_date.clone(),
+                    open,
+                    closed: closed_by_version[vi],
+                    overdue: open > 0
+                        && v.due_date
+                            .as_deref()
+                            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                            .is_some_and(|d| d < today),
+                }
+            })
+            .collect();
+
+        let ov = ProjectOverview {
+            project_id,
+            fetched_at: db::now_rfc3339(),
+            issues,
+            truncated,
+            members,
+            versions,
+            weekly,
+        };
+        self.overviews
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(project_id, (std::time::Instant::now(), ov.clone()));
+        Ok(ov)
+    }
+
+    /// 为待转派任务推荐负责人；`use_ai` 时由 AI 综合判断，否则用本地算法
+    pub async fn suggest_assignments(&self, project_id: u64, issue_ids: &[u64], use_ai: bool) -> Result<Vec<AssignSuggestion>> {
+        if issue_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let ov = self.project_overview(project_id, false).await?;
+        let rm = self.redmine()?;
+        let today = chrono::Local::now().date_naive();
+        let mut targets: Vec<ProjectIssue> = Vec::new();
+        for id in issue_ids {
+            match ov.issues.iter().find(|i| i.id == *id) {
+                Some(i) => targets.push(i.clone()),
+                None => targets.push(project::to_project_issue(&rm.get_issue(*id).await?, today)),
+            }
+        }
+        let categories = rm.issue_categories(project_id).await.unwrap_or_default();
+        // 近 120 天关闭、且没有回派给提出人的任务，反映谁处理过什么
+        let since = (today - chrono::Duration::days(120)).format("%Y-%m-%d").to_string();
+        let closed = rm
+            .list_issues(&IssueQuery {
+                project: Some(project_id.to_string()),
+                status: "closed".into(),
+                updated_since: Some(since),
+                max_results: 500,
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default();
+        let mut refs = ov.issues.clone();
+        refs.extend(
+            closed
+                .iter()
+                .map(|i| project::to_project_issue(i, today))
+                .filter(|i| i.assignee_id.is_some() && i.assignee_id != i.author_id),
+        );
+        let mut load: HashMap<u64, usize> = HashMap::new();
+        for i in &ov.issues {
+            if let Some(a) = i.assignee_id {
+                *load.entry(a).or_default() += 1;
+            }
+        }
+        let local = project::local_suggestions(&targets, &refs, &ov.members, &categories, &load);
+        if !use_ai {
+            return Ok(local);
+        }
+        self.ai_assign(project_id, &targets, &ov, &categories, &load, local).await
+    }
+
+    async fn ai_assign(
+        &self,
+        project_id: u64,
+        targets: &[ProjectIssue],
+        ov: &ProjectOverview,
+        categories: &[IssueCategory],
+        load: &HashMap<u64, usize>,
+        local: Vec<AssignSuggestion>,
+    ) -> Result<Vec<AssignSuggestion>> {
+        let cfg = self.config();
+        if cfg.ai.excluded_project_ids.contains(&project_id) {
+            return Err(coded("AI_EXCLUDED", "该项目已设置为不发送给 AI，请使用“按历史推荐”"));
+        }
+        let ai = self.ai_client(true)?;
+        let cands = project::candidates(&ov.members);
+        if cands.is_empty() {
+            return Ok(local);
+        }
+        let mut body = String::from("项目成员：\n");
+        for c in &cands {
+            let own: Vec<String> = ov
+                .issues
+                .iter()
+                .filter(|i| i.assignee_id == Some(c.id))
+                .take(6)
+                .map(|i| format!("#{} {}", i.id, truncate(&i.subject, 30)))
+                .collect();
+            body.push_str(&format!(
+                "- [{}] {}（{}）当前未关闭 {} 个；正在负责：{}\n",
+                c.id,
+                c.name,
+                if c.roles.is_empty() { "角色未知".into() } else { c.roles.join("、") },
+                load.get(&c.id).copied().unwrap_or(0),
+                if own.is_empty() { "无".into() } else { own.join("；") }
+            ));
+        }
+        let defaults: Vec<String> = categories
+            .iter()
+            .filter_map(|c| c.assigned_to.as_ref().map(|a| format!("{} → {}", c.name, a.name)))
+            .collect();
+        if !defaults.is_empty() {
+            body.push_str(&format!("\n类别默认负责人：{}\n", defaults.join("；")));
+        }
+        body.push_str("\n本地算法的推荐（仅供参考）：\n");
+        for s in &local {
+            body.push_str(&format!("- #{} → {}（{}）\n", s.issue_id, s.assignee_name, s.reason));
+        }
+        body.push_str("\n待分配任务：\n");
+        for t in targets {
+            body.push_str(&format!(
+                "### #{} [{} / {} / {}] 优先级：{} 截止：{} 当前负责人：{}\n标题：{}\n描述：{}\n\n",
+                t.id,
+                t.tracker,
+                t.category.as_deref().unwrap_or("无类别"),
+                t.version.as_deref().unwrap_or("无版本"),
+                t.priority,
+                t.due_date.as_deref().unwrap_or("-"),
+                if t.assignee.is_empty() { "未指派" } else { &t.assignee },
+                t.subject,
+                truncate(&t.description, 300)
+            ));
+        }
+        let msgs = vec![
+            Message::system(prompts::with_extra(prompts::assign_system(), &cfg.ai.custom_prompts.plan)),
+            Message::user(self.prep_for_ai(&body)),
+        ];
+        let (v, usage) = ai.chat_json::<Value>(&msgs).await?;
+        self.record_usage("assign", &ai.model, usage);
+        let mut by_issue: HashMap<u64, (u64, String)> = HashMap::new();
+        for item in v["assignments"].as_array().cloned().unwrap_or_default() {
+            let (Some(iid), Some(aid)) = (v_u64(&item["issueId"]), v_u64(&item["assigneeId"])) else { continue };
+            if cands.iter().any(|c| c.id == aid) {
+                by_issue.insert(iid, (aid, v_str(&item["reason"]).unwrap_or_default()));
+            }
+        }
+        // AI 没给出有效结果的任务沿用本地推荐
+        Ok(local
+            .into_iter()
+            .map(|s| match by_issue.get(&s.issue_id) {
+                Some((aid, reason)) => AssignSuggestion {
+                    issue_id: s.issue_id,
+                    assignee_id: Some(*aid),
+                    assignee_name: cands.iter().find(|c| c.id == *aid).map(|c| c.name.clone()).unwrap_or_default(),
+                    reason: if reason.is_empty() { "AI 推荐".into() } else { reason.clone() },
+                    source: "ai".into(),
+                },
+                None => s,
+            })
+            .collect())
+    }
+
+    /// 批量转派：每个任务指派给各自的目标成员，可附带同一条说明（并发 4 个）
+    pub async fn bulk_assign(self: &Arc<Self>, items: &[AssignItem], notes: Option<String>) -> Vec<ResolveOutcome> {
+        let notes = notes.filter(|n| !n.trim().is_empty());
+        let sem = Arc::new(Semaphore::new(4));
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, it) in items.iter().cloned().enumerate() {
+            let svc = Arc::clone(self);
+            let sem = Arc::clone(&sem);
+            let notes = notes.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire().await;
+                let plan = UpdatePlan { notes, assign_to: Some(it.assignee_id), ..Default::default() };
+                let out = match svc.apply_update(it.issue_id, plan).await {
+                    Ok(o) => o,
+                    Err(e) => ResolveOutcome { issue_id: it.issue_id, ok: false, error: Some(e.to_string()), ..Default::default() },
+                };
+                (idx, out)
+            });
+        }
+        let mut outs: Vec<(usize, ResolveOutcome)> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(r) = joined {
+                outs.push(r);
+            }
+        }
+        outs.sort_by_key(|(i, _)| *i);
+        write(&self.overviews, HashMap::new());
+        self.emit(AppEvent::IssuesChanged);
+        outs.into_iter().map(|(_, o)| o).collect()
     }
 
     // ---------------- 统计与报告 ----------------

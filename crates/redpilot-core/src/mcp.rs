@@ -5,7 +5,7 @@
 //!
 //! 写操作（回派、追问、备注、改状态、建关联）默认关闭，需在设置中打开“允许外部 AI 写操作”。
 
-use crate::models::{IssueFilter, IssueView, ResolveRequest};
+use crate::models::{AssignItem, IssueFilter, IssueView, ResolveRequest};
 use crate::service::Service;
 use anyhow::Result;
 use axum::extract::State;
@@ -180,6 +180,50 @@ pub struct StatusParams {
     /// 同时写入的备注（可选）
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OverviewParams {
+    pub project_id: u64,
+    /// 最多返回多少个任务明细，默认 50
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// 只看未指派的任务
+    #[serde(default)]
+    pub unassigned_only: bool,
+    /// 只看已逾期的任务
+    #[serde(default)]
+    pub overdue_only: bool,
+    /// 只看某个成员负责的任务
+    #[serde(default)]
+    pub assignee_id: Option<u64>,
+    /// 忽略 5 分钟缓存，重新从 Redmine 读取
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SuggestAssignParams {
+    pub project_id: u64,
+    pub issue_ids: Vec<u64>,
+    /// 用 AI 综合判断（默认 false：用本地算法，按类别默认负责人、相似任务和负载推荐）
+    #[serde(default)]
+    pub use_ai: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkAssignParams {
+    /// 每个任务指派给谁
+    pub assignments: Vec<BulkAssignItem>,
+    /// 写入每个任务的统一说明（可选），被指派人会收到通知
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkAssignItem {
+    pub issue_id: u64,
+    pub assignee_id: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -382,6 +426,77 @@ impl RedPilotMcp {
     async fn list_assignees(&self, Parameters(p): Parameters<IssueIdParams>) -> ToolResult {
         self.prepare();
         to_json(&self.svc.assignees_for_issue(p.issue_id).await.map_err(err)?)
+    }
+
+    #[tool(description = "列出我参与的项目及我的角色，标记出我担任管理角色的项目（项目经理视角的入口）。")]
+    async fn list_my_projects(&self) -> ToolResult {
+        self.prepare();
+        to_json(&self.svc.my_projects().await.map_err(err)?)
+    }
+
+    #[tool(description = "项目全局视角：全部未关闭任务的统计（未指派、逾期、停滞、各成员负载）、版本进度、近 8 周新增与关闭趋势，以及按条件筛选的任务明细。")]
+    async fn get_project_overview(&self, Parameters(p): Parameters<OverviewParams>) -> ToolResult {
+        self.prepare();
+        let ov = self.svc.project_overview(p.project_id, p.refresh).await.map_err(err)?;
+        let mut by_assignee: Vec<(String, usize, usize)> = Vec::new();
+        for i in &ov.issues {
+            let name = if i.assignee.is_empty() { "（未指派）".to_string() } else { i.assignee.clone() };
+            match by_assignee.iter_mut().find(|x| x.0 == name) {
+                Some(x) => {
+                    x.1 += 1;
+                    x.2 += i.overdue as usize;
+                }
+                None => by_assignee.push((name, 1, i.overdue as usize)),
+            }
+        }
+        by_assignee.sort_by(|a, b| b.1.cmp(&a.1));
+        let picked: Vec<Value> = ov
+            .issues
+            .iter()
+            .filter(|i| !p.unassigned_only || i.assignee_id.is_none())
+            .filter(|i| !p.overdue_only || i.overdue)
+            .filter(|i| p.assignee_id.is_none() || i.assignee_id == p.assignee_id)
+            .take(p.limit.unwrap_or(50).min(500))
+            .map(|i| {
+                json!({
+                    "id": i.id, "subject": i.subject, "tracker": i.tracker, "status": i.status, "priority": i.priority,
+                    "assignee": i.assignee, "assigneeId": i.assignee_id, "author": i.author, "category": i.category,
+                    "version": i.version, "dueDate": i.due_date, "overdue": i.overdue, "staleDays": i.stale_days,
+                    "url": format!("{}/issues/{}", self.base_url(), i.id),
+                })
+            })
+            .collect();
+        to_json(&json!({
+            "projectId": ov.project_id,
+            "fetchedAt": ov.fetched_at,
+            "openTotal": ov.issues.len(),
+            "truncated": ov.truncated,
+            "unassigned": ov.issues.iter().filter(|i| i.assignee_id.is_none()).count(),
+            "overdue": ov.issues.iter().filter(|i| i.overdue).count(),
+            "stale14d": ov.issues.iter().filter(|i| i.stale_days >= 14).count(),
+            "byAssignee": by_assignee.iter().map(|(n, open, overdue)| json!({ "assignee": n, "open": open, "overdue": overdue })).collect::<Vec<_>>(),
+            "versions": ov.versions,
+            "weekly": ov.weekly,
+            "members": ov.members,
+            "issues": picked,
+        }))
+    }
+
+    #[tool(description = "为一批任务推荐负责人（每个任务给出建议人选和理由）。默认用本地算法（类别默认负责人、相似任务由谁负责、负载），use_ai=true 时由 AI 综合判断。只给建议，不修改 Redmine。")]
+    async fn suggest_assignments(&self, Parameters(p): Parameters<SuggestAssignParams>) -> ToolResult {
+        self.prepare();
+        to_json(&self.svc.suggest_assignments(p.project_id, &p.issue_ids, p.use_ai).await.map_err(err)?)
+    }
+
+    #[tool(description = "【写操作】批量转派：把每个任务指派给指定成员（可以各不相同），可附带统一说明。建议先用 suggest_assignments 生成方案并让用户确认。")]
+    async fn bulk_assign(&self, Parameters(p): Parameters<BulkAssignParams>) -> ToolResult {
+        self.ensure_write()?;
+        let items: Vec<AssignItem> = p
+            .assignments
+            .iter()
+            .map(|a| AssignItem { issue_id: a.issue_id, assignee_id: a.assignee_id })
+            .collect();
+        to_json(&self.svc.bulk_assign(&items, p.notes).await)
     }
 
     #[tool(description = "根据处理要点起草规范的处置说明（问题原因/处理方法/处理结果/影响范围/验证建议），只生成不提交。多个任务时生成一份共用说明。")]

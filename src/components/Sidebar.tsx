@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { BarChart3, Inbox, RefreshCw, Search, Settings, Sparkles, Plug } from "lucide-react";
+import { BarChart3, FolderKanban, Inbox, RefreshCw, Search, Settings, Sparkles, Plug } from "lucide-react";
 import type { ReactNode } from "react";
 import { useApp, type Page } from "../lib/store";
 import { isMac, modKey, relativeTime } from "../lib/format";
@@ -40,6 +40,7 @@ export function Sidebar() {
 
       <nav className="flex flex-col gap-0.5 px-2.5">
         <NavItem icon={<Inbox className="size-4" />} label="收件箱" page="inbox" current={page} onClick={setPage} count={stats?.openTotal} dot={!!stats?.unread} />
+        <NavItem icon={<FolderKanban className="size-4" />} label="项目总览" page="project" current={page} onClick={setPage} />
         <NavItem icon={<Sparkles className="size-4" />} label="AI 规划" page="plan" current={page} onClick={setPage} />
         <NavItem icon={<BarChart3 className="size-4" />} label="统计与报告" page="dashboard" current={page} onClick={setPage} />
         <NavItem icon={<Settings className="size-4" />} label="设置" page="settings" current={page} onClick={setPage} />
