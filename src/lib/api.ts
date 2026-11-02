@@ -342,6 +342,19 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url", { url }),
 };
 
+const blobUrls = new Map<number, Promise<string>>();
+
+/** 附件的本地预览地址：后端带 API Key 下载并缓存，前端转成 Blob URL（同一附件只取一次） */
+export function attachmentUrl(id: number, contentType?: string | null): Promise<string> {
+  let p = blobUrls.get(id);
+  if (!p) {
+    p = invoke<ArrayBuffer>("attachment_bytes", { id }).then((buf) => URL.createObjectURL(new Blob([buf], { type: contentType ?? "" })));
+    p.catch(() => blobUrls.delete(id));
+    blobUrls.set(id, p);
+  }
+  return p;
+}
+
 export function onAppEvent(cb: (e: AppEvent) => void): Promise<UnlistenFn> {
   return listen<AppEvent>("redpilot://event", (e) => cb(e.payload));
 }

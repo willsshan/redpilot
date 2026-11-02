@@ -226,6 +226,13 @@ pub fn stage_attachment(state: State<'_, AppState>, request: Request<'_>) -> Cmd
     state.svc.stage_attachment(&name, bytes).map_err(e)
 }
 
+/// 附件原始内容，前端转成 Blob 显示图片
+#[tauri::command]
+pub async fn attachment_bytes(state: State<'_, AppState>, id: u64) -> CmdResult<tauri::ipc::Response> {
+    let bytes = state.svc.attachment(id).await.map_err(e)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[tauri::command]
 pub fn recent_changes(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec<IssueChange>> {
     state.svc.recent_changes(limit).map_err(e)

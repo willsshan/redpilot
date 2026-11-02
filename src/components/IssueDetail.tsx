@@ -21,6 +21,8 @@ import { useToast } from "../lib/toast";
 import { categoryColor, dateTime, dueLabel, formatHours, priorityTone, relativeTime, urgencyColor } from "../lib/format";
 import { useIssueTimer } from "../lib/timer";
 import { Avatar, Badge, Button, IconButton, Input, Kbd, SectionTitle, Select, Spinner } from "./ui";
+import { isImage, RichText, Thumbnail } from "./RichText";
+import type { Attachment } from "../lib/api";
 
 const FIELD_NAMES: Record<string, string> = {
   status_id: "状态",
@@ -221,16 +223,25 @@ export function IssueDetail({
           {/* 描述 */}
           <div className="mt-7">
             <SectionTitle>问题描述</SectionTitle>
-            <div className="selectable text-[13.5px] leading-[1.75] whitespace-pre-wrap text-ink">
-              {is.description?.trim() || <span className="text-ink-3">（无描述）</span>}
-            </div>
+            {is.description?.trim() ? (
+              <RichText text={is.description.trim()} attachments={is.attachments} className="text-[13.5px] leading-[1.75] text-ink" />
+            ) : (
+              <div className="text-[13.5px] text-ink-3">（无描述）</div>
+            )}
           </div>
 
           {is.attachments.length > 0 && (
             <div className="mt-6">
               <SectionTitle icon={<Paperclip className="size-3.5" />}>附件 {is.attachments.length}</SectionTitle>
+              {is.attachments.some(isImage) && (
+                <div className="mb-2 flex flex-wrap gap-2">
+                  {is.attachments.filter(isImage).map((f) => (
+                    <Thumbnail key={f.id} att={f} attachments={is.attachments} />
+                  ))}
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
-                {is.attachments.map((f) => (
+                {is.attachments.filter((f) => !isImage(f)).map((f) => (
                   <button
                     key={f.id}
                     onClick={() => void api.openUrl(f.contentUrl)}
@@ -275,7 +286,7 @@ export function IssueDetail({
             ) : (
               <ol className="relative space-y-4 border-l border-line pl-5">
                 {is.journals.map((j) => (
-                  <JournalItem key={j.id} j={j} />
+                  <JournalItem key={j.id} j={j} attachments={is.attachments} />
                 ))}
               </ol>
             )}
@@ -323,9 +334,14 @@ function Meta({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function JournalItem({ j }: { j: Journal }) {
+function JournalItem({ j, attachments }: { j: Journal; attachments: Attachment[] }) {
   const name = j.user?.name ?? "未知用户";
   const changes = j.details.filter((d) => d.property === "attr");
+  // 这条记录里上传的图片；已在备注中引用的不再重复显示
+  const added = j.details
+    .filter((d) => d.property === "attachment" && d.newValue)
+    .map((d) => attachments.find((a) => String(a.id) === d.name))
+    .filter((a): a is Attachment => !!a && isImage(a) && !(j.notes ?? "").includes(a.filename));
   return (
     <li className="relative">
       <span className="absolute top-0.5 -left-[31px] rounded-full ring-4 ring-canvas">
@@ -347,8 +363,17 @@ function JournalItem({ j }: { j: Journal }) {
         </div>
       )}
       {j.notes?.trim() && (
-        <div className="selectable mt-1.5 rounded-lg border border-line bg-panel px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap text-ink">
-          {j.notes}
+        <RichText
+          text={j.notes.trim()}
+          attachments={attachments}
+          className="mt-1.5 rounded-lg border border-line bg-panel px-3 py-2 text-[13px] leading-relaxed text-ink"
+        />
+      )}
+      {added.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-2">
+          {added.map((a) => (
+            <Thumbnail key={a.id} att={a} attachments={attachments} />
+          ))}
         </div>
       )}
     </li>

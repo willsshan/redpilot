@@ -103,6 +103,7 @@ pub fn run() {
             commands::change_status,
             commands::stage_attachment,
             commands::recent_changes,
+            commands::attachment_bytes,
             commands::get_autostart,
             commands::set_autostart,
             commands::statuses,

@@ -207,6 +207,34 @@ impl RedmineClient {
         Ok(())
     }
 
+    /// 下载附件内容（附件需要 API Key 才能访问，界面无法直接引用 Redmine 上的地址）
+    pub async fn download_attachment(&self, id: u64, max_bytes: u64) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(format!("{}/attachments/download/{id}", self.base))
+            .header("X-Redmine-API-Key", &self.key)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| anyhow!("下载附件失败: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            if status == StatusCode::NOT_FOUND {
+                return Err(crate::coded("REDMINE_NOT_FOUND", "附件不存在或无权查看"));
+            }
+            let text = resp.text().await.unwrap_or_default();
+            return Err(map_error(status, &text));
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(crate::coded("ATTACHMENT_TOO_LARGE", "附件太大，无法预览，请在浏览器中打开"));
+        }
+        let bytes = resp.bytes().await.map_err(|e| anyhow!("下载附件失败: {e}"))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(crate::coded("ATTACHMENT_TOO_LARGE", "附件太大，无法预览，请在浏览器中打开"));
+        }
+        Ok(bytes.to_vec())
+    }
+
     /// 上传文件，返回附件令牌
     pub async fn upload(&self, bytes: Vec<u8>, filename: &str, content_type: Option<&str>) -> Result<UploadRef> {
         #[derive(Deserialize)]
@@ -369,7 +397,37 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_local_target;
+    use super::*;
+
+    #[tokio::test]
+    async fn downloads_attachments_with_api_key() {
+        use axum::extract::Path as AxPath;
+        use axum::http::HeaderMap;
+        let app = axum::Router::new().route(
+            "/attachments/download/{id}",
+            axum::routing::get(|AxPath(id): AxPath<u64>, h: HeaderMap| async move {
+                if h.get("X-Redmine-API-Key").and_then(|v| v.to_str().ok()) != Some("k") {
+                    return (StatusCode::UNAUTHORIZED, Vec::new());
+                }
+                match id {
+                    7 => (StatusCode::OK, b"\x89PNG-data".to_vec()),
+                    8 => (StatusCode::OK, vec![0u8; 2048]),
+                    _ => (StatusCode::NOT_FOUND, Vec::new()),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = RedmineConfig { base_url: format!("http://{addr}"), proxy: "direct".into(), ..Default::default() };
+
+        let rm = RedmineClient::new(&cfg, "k").unwrap();
+        assert_eq!(rm.download_attachment(7, 1024).await.unwrap(), b"\x89PNG-data");
+        assert!(rm.download_attachment(9, 1024).await.unwrap_err().to_string().contains("REDMINE_NOT_FOUND"));
+        assert!(rm.download_attachment(8, 1024).await.unwrap_err().to_string().contains("ATTACHMENT_TOO_LARGE"));
+        let bad = RedmineClient::new(&cfg, "wrong").unwrap();
+        assert!(bad.download_attachment(7, 1024).await.unwrap_err().to_string().contains("REDMINE_AUTH"));
+    }
 
     #[test]
     fn detects_intranet_targets() {

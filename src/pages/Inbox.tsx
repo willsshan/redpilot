@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import clsx from "clsx";
-import { Check, CornerUpLeft, Inbox as InboxIcon, Kanban, LayoutList, MessageSquareText, PlugZap, RefreshCw, Search, Sparkles, X } from "lucide-react";
+import { Check, ChevronDown, CornerUpLeft, Inbox as InboxIcon, Kanban, LayoutList, MessageSquareText, PlugZap, RefreshCw, Search, Sparkles, X } from "lucide-react";
 import { api, errorText, type IssueDetail as Detail, type IssueView, type NamedId } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
-import { categoryColor, dueLabel, isMac, priorityTone, relativeTime } from "../lib/format";
+import { categoryColor, dateTime, dueLabel, isMac, priorityTone, relativeTime } from "../lib/format";
 import { Avatar, Badge, Button, CategoryBadge, Empty, Kbd } from "../components/ui";
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
@@ -12,6 +12,57 @@ import { Board, type GroupBy } from "../components/Board";
 
 type Quick = "all" | "unread" | "changed" | "overdue" | "missing";
 type View = "list" | "board";
+type SortBy = "created" | "updated" | "priority" | "due";
+type ListGroup = "month" | "project" | "none";
+
+const SORTERS: Record<SortBy, (a: IssueView, b: IssueView) => number> = {
+  created: (a, b) => b.createdOn.localeCompare(a.createdOn) || b.id - a.id,
+  updated: (a, b) => b.updatedOn.localeCompare(a.updatedOn) || b.id - a.id,
+  priority: (a, b) => b.priorityId - a.priorityId || b.createdOn.localeCompare(a.createdOn),
+  // 有截止日期的按日期从近到远，没有的排在最后
+  due: (a, b) => (a.dueDate ?? "9999").localeCompare(b.dueDate ?? "9999") || b.createdOn.localeCompare(a.createdOn),
+};
+
+interface IssueGroup {
+  key: string;
+  title: string;
+  items: IssueView[];
+}
+
+function monthKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "未知";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+/** 列表分组：按月份（按更新排序时用更新月份，否则用提出月份，新的在前）或按项目（任务多的在前） */
+function groupIssues(sorted: IssueView[], by: ListGroup, sortBy: SortBy): IssueGroup[] {
+  if (by === "none") return [{ key: "all", title: "", items: sorted }];
+  const m = new Map<string, IssueGroup>();
+  const now = monthKey(new Date().toISOString());
+  for (const i of sorted) {
+    let key: string;
+    let title: string;
+    if (by === "month") {
+      key = monthKey(sortBy === "updated" ? i.updatedOn : i.createdOn);
+      const [y, mo] = key.split("-");
+      title = key === now ? `本月 · ${Number(mo)} 月` : mo ? `${y} 年 ${Number(mo)} 月` : key;
+    } else {
+      key = String(i.projectId);
+      title = i.projectName || "未知项目";
+    }
+    let g = m.get(key);
+    if (!g) {
+      g = { key, title, items: [] };
+      m.set(key, g);
+    }
+    g.items.push(i);
+  }
+  const groups = [...m.values()];
+  if (by === "month") groups.sort((a, b) => b.key.localeCompare(a.key));
+  else groups.sort((a, b) => b.items.length - a.items.length || a.title.localeCompare(b.title, "zh-CN"));
+  return groups;
+}
 
 function stored<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   try {
@@ -47,7 +98,11 @@ export function InboxPage() {
   const [followUp, setFollowUp] = useState(false);
   const [analyzingAll, setAnalyzingAll] = useState(false);
   const [view, setViewState] = useState<View>(() => stored("rp.inbox.view", ["list", "board"] as const, "list"));
-  const [groupBy, setGroupByState] = useState<GroupBy>(() => stored("rp.board.group", ["status", "category", "urgency"] as const, "status"));
+  const [groupBy, setGroupByState] = useState<GroupBy>(() => stored("rp.board.group", ["status", "category", "project", "urgency"] as const, "status"));
+  const [sortBy, setSortByState] = useState<SortBy>(() => stored("rp.list.sort", ["created", "updated", "priority", "due"] as const, "created"));
+  const [listGroup, setListGroupState] = useState<ListGroup>(() => stored("rp.list.group", ["month", "project", "none"] as const, "month"));
+  const [project, setProject] = useState<number | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [drawer, setDrawer] = useState(false);
   const [statuses, setStatuses] = useState<NamedId[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -60,6 +115,15 @@ export function InboxPage() {
   const setGroupBy = (g: GroupBy) => {
     setGroupByState(g);
     remember("rp.board.group", g);
+  };
+  const setSortBy = (v: SortBy) => {
+    setSortByState(v);
+    remember("rp.list.sort", v);
+  };
+  const setListGroup = (v: ListGroup) => {
+    setListGroupState(v);
+    setCollapsed(new Set());
+    remember("rp.list.group", v);
   };
 
   useEffect(() => {
@@ -99,8 +163,25 @@ export function InboxPage() {
     }
   }, [focusIssue, setFocusIssue, view]);
 
-  const visible = useMemo(() => {
-    return issues.filter((i) => {
+  const projects = useMemo(() => {
+    const m = new Map<number, { id: number; name: string; count: number }>();
+    for (const i of issues) {
+      const p = m.get(i.projectId) ?? { id: i.projectId, name: i.projectName, count: 0 };
+      p.count += 1;
+      m.set(i.projectId, p);
+    }
+    return [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "zh-CN"));
+  }, [issues]);
+
+  // 选中的项目同步后不存在了，就回到全部项目
+  useEffect(() => {
+    if (project !== null && loaded && !projects.some((p) => p.id === project)) setProject(null);
+  }, [projects, project, loaded]);
+
+  const inProject = useMemo(() => (project === null ? issues : issues.filter((i) => i.projectId === project)), [issues, project]);
+
+  const sorted = useMemo(() => {
+    const filtered = inProject.filter((i) => {
       if (category && (i.analysis.category ?? "未分类") !== category) return false;
       if (quick === "unread" && !i.unread) return false;
       if (quick === "changed" && !i.changeHint) return false;
@@ -108,16 +189,21 @@ export function InboxPage() {
       if (quick === "missing" && i.analysis.missingInfo.length === 0) return false;
       return true;
     });
-  }, [issues, category, quick]);
+    return filtered.sort(SORTERS[sortBy]);
+  }, [inProject, category, quick, sortBy]);
+
+  const groups = useMemo(() => groupIssues(sorted, listGroup, sortBy), [sorted, listGroup, sortBy]);
+  // 列表中实际显示的顺序（折叠的分组不参与 J/K 切换）
+  const visible = useMemo(() => groups.flatMap((g) => (collapsed.has(g.key) ? [] : g.items)), [groups, collapsed]);
 
   const categoryCounts = useMemo(() => {
     const m = new Map<string, number>();
-    for (const i of issues) {
+    for (const i of inProject) {
       const c = i.analysis.category ?? "未分类";
       m.set(c, (m.get(c) ?? 0) + 1);
     }
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
-  }, [issues]);
+  }, [inProject]);
 
   // 列表视图默认选中第一条
   useEffect(() => {
@@ -301,6 +387,7 @@ export function InboxPage() {
           >
             <option value="status">按状态分组</option>
             <option value="category">按分类分组</option>
+            <option value="project">按项目分组</option>
             <option value="urgency">按紧急度分组</option>
           </select>
         )}
@@ -335,8 +422,31 @@ export function InboxPage() {
 
       {/* 筛选 */}
       <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-line px-5 py-2">
+        <label
+          className={clsx(
+            "relative inline-flex h-7 shrink-0 items-center rounded-full border pr-6 pl-2.5 text-[12.5px]",
+            project !== null ? "border-accent/50 bg-accent-soft text-accent-ink" : "border-line bg-panel text-ink-2 hover:bg-hover",
+          )}
+          title="按项目筛选"
+        >
+          <select
+            value={project ?? ""}
+            onChange={(e) => setProject(e.target.value ? Number(e.target.value) : null)}
+            className="absolute inset-0 cursor-default opacity-0"
+          >
+            <option value="">全部项目（{issues.length}）</option>
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}（{p.count}）
+              </option>
+            ))}
+          </select>
+          <span className="max-w-[160px] truncate">{project !== null ? (projects.find((p) => p.id === project)?.name ?? "项目") : "全部项目"}</span>
+          <ChevronDown className="pointer-events-none absolute right-2 size-3" />
+        </label>
+        <div className="mx-1 h-4 w-px shrink-0 bg-line" />
         <Chip active={category === null} onClick={() => setCategory(null)}>
-          全部 <span className="text-ink-3">{issues.length}</span>
+          全部 <span className="text-ink-3">{inProject.length}</span>
         </Chip>
         {categoryCounts.map(([c, n]) => (
           <Chip key={c} active={category === c} onClick={() => setCategory(category === c ? null : c)}>
@@ -367,7 +477,7 @@ export function InboxPage() {
             <Empty icon={<InboxIcon className="size-6" />} title="收件箱已清空" desc="当前没有指派给你的未关闭任务，休息一下吧。" />
           ) : (
             <Board
-              issues={visible}
+              issues={sorted}
               groupBy={groupBy}
               statuses={statuses}
               categories={categories}
@@ -413,25 +523,76 @@ export function InboxPage() {
               desc={loadError}
               action={<Button onClick={() => void load()}>重试</Button>}
             />
-          ) : visible.length === 0 ? (
-            <Empty
-              icon={<InboxIcon className="size-6" />}
-              title={issues.length === 0 ? "收件箱已清空" : "没有符合条件的任务"}
-              desc={issues.length === 0 ? "当前没有指派给你的未关闭任务，休息一下吧。" : "试试调整筛选条件。"}
-            />
           ) : (
-            <ul className="divide-y divide-line/70">
-              {visible.map((i) => (
-                <IssueRow
-                  key={i.id}
-                  issue={i}
-                  active={i.id === selected}
-                  checked={checked.has(i.id)}
-                  onClick={() => setSelected(i.id)}
-                  onCheck={() => toggleCheck(i.id)}
+            <>
+              <div className="sticky top-0 z-[2] flex items-center gap-1 border-b border-line bg-canvas/95 px-3 py-1.5 text-[12px] text-ink-3 backdrop-blur">
+                <span className="mr-auto pl-1 tabular-nums">{sorted.length} 个任务</span>
+                <MiniSelect
+                  value={listGroup}
+                  onChange={(v) => setListGroup(v as ListGroup)}
+                  options={[
+                    ["month", "按月份分组"],
+                    ["project", "按项目分组"],
+                    ["none", "不分组"],
+                  ]}
                 />
-              ))}
-            </ul>
+                <MiniSelect
+                  value={sortBy}
+                  onChange={(v) => setSortBy(v as SortBy)}
+                  options={[
+                    ["created", "提出时间 · 新→旧"],
+                    ["updated", "更新时间 · 新→旧"],
+                    ["priority", "优先级 · 高→低"],
+                    ["due", "截止日期 · 近→远"],
+                  ]}
+                />
+              </div>
+              {sorted.length === 0 ? (
+                <Empty
+                  icon={<InboxIcon className="size-6" />}
+                  title={issues.length === 0 ? "收件箱已清空" : "没有符合条件的任务"}
+                  desc={issues.length === 0 ? "当前没有指派给你的未关闭任务，休息一下吧。" : "试试调整筛选条件。"}
+                />
+              ) : (
+                groups.map((g) => (
+                  <section key={g.key}>
+                    {g.title && (
+                      <button
+                        onClick={() =>
+                          setCollapsed((s) => {
+                            const n = new Set(s);
+                            if (n.has(g.key)) n.delete(g.key);
+                            else n.add(g.key);
+                            return n;
+                          })
+                        }
+                        className="sticky top-[33px] z-[1] flex w-full items-center gap-1.5 border-b border-line/70 bg-sunken/95 px-4 py-1.5 text-left text-[12px] font-semibold text-ink-2 backdrop-blur hover:text-ink"
+                      >
+                        <ChevronDown className={clsx("size-3.5 text-ink-3 transition-transform", collapsed.has(g.key) && "-rotate-90")} />
+                        <span className="truncate">{g.title}</span>
+                        <span className="font-normal text-ink-3 tabular-nums">{g.items.length}</span>
+                      </button>
+                    )}
+                    {!collapsed.has(g.key) && (
+                      <ul className="divide-y divide-line/70">
+                        {g.items.map((i) => (
+                          <IssueRow
+                            key={i.id}
+                            issue={i}
+                            active={i.id === selected}
+                            checked={checked.has(i.id)}
+                            onClick={() => setSelected(i.id)}
+                            onCheck={() => toggleCheck(i.id)}
+                            showProject={listGroup !== "project"}
+                            showUpdated={sortBy === "updated"}
+                          />
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                ))
+              )}
+            </>
           )}
 
           {checked.size > 0 && (
@@ -490,18 +651,39 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
   );
 }
 
+function MiniSelect({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: [string, string][] }) {
+  return (
+    <label className="relative inline-flex h-6 items-center rounded-md pr-5 pl-1.5 text-ink-2 hover:bg-hover">
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="absolute inset-0 cursor-default opacity-0">
+        {options.map(([v, label]) => (
+          <option key={v} value={v}>
+            {label}
+          </option>
+        ))}
+      </select>
+      {options.find(([v]) => v === value)?.[1]}
+      <ChevronDown className="pointer-events-none absolute right-1 size-3 text-ink-3" />
+    </label>
+  );
+}
+
 function IssueRow({
   issue: i,
   active,
   checked,
   onClick,
   onCheck,
+  showProject = true,
+  showUpdated = false,
 }: {
   issue: IssueView;
   active: boolean;
   checked: boolean;
   onClick: () => void;
   onCheck: () => void;
+  showProject?: boolean;
+  /** 按更新时间排序时显示更新时间，否则显示提出时间 */
+  showUpdated?: boolean;
 }) {
   const a = i.analysis;
   const due = dueLabel(i.dueDate);
@@ -535,8 +717,10 @@ function IssueRow({
         <div className="flex items-center gap-1.5 text-[11.5px] text-ink-3">
           {i.unread && <span className="size-1.5 rounded-full bg-accent" />}
           <span className="font-mono">#{i.id}</span>
-          <span className="truncate">· {i.projectName}</span>
-          <span className="ml-auto shrink-0">{relativeTime(i.updatedOn)}</span>
+          {showProject && <span className="truncate">· {i.projectName}</span>}
+          <span className="ml-auto shrink-0" title={`提出于 ${dateTime(i.createdOn)}，更新于 ${dateTime(i.updatedOn)}`}>
+            {showUpdated ? `${relativeTime(i.updatedOn)}更新` : `${relativeTime(i.createdOn)}提出`}
+          </span>
         </div>
         <div className={clsx("mt-0.5 line-clamp-2 text-[13.5px] leading-snug text-ink", i.unread ? "font-semibold" : "font-medium")}>{i.subject}</div>
         {i.changeHint ? (

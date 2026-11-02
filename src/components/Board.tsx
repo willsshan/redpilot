@@ -5,7 +5,7 @@ import type { IssueView, NamedId } from "../lib/api";
 import { categoryColor, dueLabel, priorityTone, urgencyColor } from "../lib/format";
 import { Avatar, Badge, CategoryBadge } from "./ui";
 
-export type GroupBy = "status" | "category" | "urgency";
+export type GroupBy = "status" | "category" | "project" | "urgency";
 
 interface Column {
   key: string;
@@ -68,6 +68,18 @@ export function Board({
       }
       return cols;
     }
+    if (groupBy === "project") {
+      const m = new Map<number, Column>();
+      for (const i of issues) {
+        let c = m.get(i.projectId);
+        if (!c) {
+          c = { key: String(i.projectId), title: i.projectName, color: "var(--info)", items: [], droppable: false };
+          m.set(i.projectId, c);
+        }
+        c.items.push(i);
+      }
+      return [...m.values()].sort((a, b) => b.items.length - a.items.length);
+    }
     const cols = [...URGENCY, "未评估"].map((u) => ({
       key: u,
       title: u === "未评估" ? u : `紧急度 ${u}`,
@@ -81,7 +93,7 @@ export function Board({
 
   const [dragging, setDragging] = useState<IssueView | null>(null);
   const [overKey, setOverKey] = useState<string | null>(null);
-  const draggable = groupBy !== "urgency";
+  const draggable = groupBy === "status" || groupBy === "category";
 
   function dropOn(key: string, e: DragEvent) {
     e.preventDefault();
@@ -213,7 +225,7 @@ function Card({
       <div className="flex items-center gap-1.5 text-[11.5px] text-ink-3">
         {i.unread && <span className="size-1.5 rounded-full bg-accent" />}
         <span className="font-mono">#{i.id}</span>
-        <span className="truncate">· {i.projectName}</span>
+        {groupBy !== "project" && <span className="truncate">· {i.projectName}</span>}
       </div>
       <div className={clsx("mt-1 line-clamp-2 text-[13px] leading-snug text-ink", i.unread ? "font-semibold" : "font-medium")}>{i.subject}</div>
       {i.changeHint && (

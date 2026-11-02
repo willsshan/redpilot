@@ -38,6 +38,11 @@ impl Paths {
     pub fn staging_dir(&self) -> PathBuf {
         self.root.join("staging")
     }
+
+    /// 已下载的附件（用于在界面中预览图片）
+    pub fn attachment_cache_dir(&self) -> PathBuf {
+        self.root.join("cache").join("attachments")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

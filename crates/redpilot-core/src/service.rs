@@ -21,6 +21,8 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex, Semaphore};
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 /// 每次同步最多为多少个有更新的任务拉取沟通记录
 const CHANGE_DETAIL_LIMIT: usize = 30;
+/// 可在界面中预览的附件大小上限
+const MAX_PREVIEW_BYTES: u64 = 30 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -66,7 +68,8 @@ impl Service {
     pub fn open(paths: Paths) -> Result<Arc<Self>> {
         let cfg = config::load(&paths.config_file())?;
         let db = Db::open(&paths.db_file())?;
-        cleanup_staging(&paths.staging_dir());
+        cleanup_old_entries(&paths.staging_dir(), Duration::from_secs(24 * 3600));
+        cleanup_old_entries(&paths.attachment_cache_dir(), Duration::from_secs(30 * 24 * 3600));
         let (events, _) = broadcast::channel(64);
         Ok(Arc::new(Self {
             secrets: SecretStore::new(paths.secrets_file()),
@@ -426,6 +429,26 @@ impl Service {
             self.db.kv_set("due_notified", &format!("{today_s}:{}", ids.join(",")))?;
         }
         Ok(due)
+    }
+
+    /// 附件内容（带本地缓存）。Redmine 附件内容不会变化，按 ID 缓存即可。
+    pub async fn attachment(&self, id: u64) -> Result<Vec<u8>> {
+        let dir = self.paths.attachment_cache_dir();
+        let file = dir.join(id.to_string());
+        if let Ok(bytes) = tokio::fs::read(&file).await {
+            return Ok(bytes);
+        }
+        let bytes = self.redmine()?.download_attachment(id, MAX_PREVIEW_BYTES).await?;
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::warn!("创建附件缓存目录失败: {e}");
+        } else {
+            // 先写临时文件再改名，避免并发预览读到写了一半的文件
+            let tmp = dir.join(format!("{id}.{}.tmp", uuid::Uuid::new_v4().simple()));
+            if tokio::fs::write(&tmp, &bytes).await.is_ok() && tokio::fs::rename(&tmp, &file).await.is_err() {
+                let _ = tokio::fs::remove_file(&tmp).await;
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn recent_changes(&self, limit: usize) -> Result<Vec<IssueChange>> {
@@ -1275,14 +1298,15 @@ fn guess_content_type(name: &str) -> Option<&'static str> {
     })
 }
 
-/// 清理一天前的暂存附件
-fn cleanup_staging(dir: &Path) {
+/// 删除目录下修改时间早于 max_age 的文件或子目录（暂存附件、附件缓存）
+fn cleanup_old_entries(dir: &Path, max_age: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let cutoff = SystemTime::now() - Duration::from_secs(24 * 3600);
+    let cutoff = SystemTime::now() - max_age;
     for e in entries.flatten() {
         let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff);
         if old {
-            let _ = std::fs::remove_dir_all(e.path());
+            let p = e.path();
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
         }
     }
 }
