@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import clsx from "clsx";
-import { AlertTriangle, ChevronDown, FolderKanban, Hourglass, Inbox, Milestone, RefreshCw, Search, TrendingUp, UserX, Users, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, FolderKanban, GitFork, Hourglass, Inbox, Milestone, RefreshCw, Search, TrendingUp, UserX, Users, X } from "lucide-react";
 import { api, errorText, type IssueDetail as Detail, type ProjectAccess, type ProjectIssue, type ProjectOverview } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
@@ -9,6 +9,7 @@ import { Avatar, Badge, Button, Card, Empty, SectionTitle, Spinner } from "../co
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
 import { AssignDialog } from "../components/AssignDialog";
+import { SplitDialog } from "../components/SplitDialog";
 
 type Quick = "unassigned" | "overdue" | "stale" | "high" | null;
 type SortBy = "updated" | "created" | "due" | "priority";
@@ -51,6 +52,7 @@ export function ProjectPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [resolveOpen, setResolveOpen] = useState(false);
   const [followUp, setFollowUp] = useState(false);
+  const [splitFor, setSplitFor] = useState<number | null>(null);
 
   const configured = !!config?.redmine.baseUrl && secrets.redmine;
 
@@ -167,13 +169,20 @@ export function ProjectPage() {
     };
   }, [openId, toast]);
 
+  function refreshDetail() {
+    const id = openId;
+    if (id === null) return;
+    setOpenId(null);
+    window.setTimeout(() => setOpenId(id), 0);
+  }
+
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && openId !== null && !resolveOpen && !followUp && !assignOpen) setOpenId(null);
+      if (e.key === "Escape" && openId !== null && !resolveOpen && !followUp && !assignOpen && splitFor === null) setOpenId(null);
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [openId, resolveOpen, followUp, assignOpen]);
+  }, [openId, resolveOpen, followUp, assignOpen, splitFor]);
 
   if (!configured) {
     return (
@@ -521,6 +530,11 @@ export function ProjectPage() {
           <button className="rounded p-0.5 text-ink-3 hover:bg-hover" title="清除选择" onClick={() => setChecked(new Set())}>
             <X className="size-3.5" />
           </button>
+          {checked.size === 1 && (
+            <Button icon={<GitFork className="size-4" />} onClick={() => setSplitFor([...checked][0])} title="把这个问题的不同部分拆成子任务，分给不同的人">
+              拆分…
+            </Button>
+          )}
           <Button variant="primary" icon={<Users className="size-4" />} onClick={() => setAssignOpen(true)}>
             转派给对应负责人…
           </Button>
@@ -536,13 +550,10 @@ export function ProjectPage() {
               detail={detail && detail.view.id === openId ? detail : null}
               loading={detailLoading}
               hideAi
-              onRefresh={() => {
-                const id = openId;
-                setOpenId(null);
-                window.setTimeout(() => setOpenId(id), 0);
-              }}
+              onRefresh={refreshDetail}
               onResolve={() => setResolveOpen(true)}
               onFollowUp={() => setFollowUp(true)}
+              onSplit={() => setSplitFor(openId)}
               onClose={() => setOpenId(null)}
             />
           </div>
@@ -570,6 +581,15 @@ export function ProjectPage() {
         allowedStatuses={detail?.issue.allowedStatuses}
       />
       <FollowUpDialog open={followUp} onClose={() => setFollowUp(false)} issue={detail?.view ?? null} />
+      <SplitDialog
+        issueId={splitFor}
+        onClose={() => setSplitFor(null)}
+        onDone={() => {
+          setChecked(new Set());
+          void load(true);
+          refreshDetail();
+        }}
+      />
     </div>
   );
 }

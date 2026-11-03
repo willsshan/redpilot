@@ -109,6 +109,8 @@ pub fn run() {
             commands::project_overview,
             commands::suggest_assignments,
             commands::bulk_assign,
+            commands::suggest_split,
+            commands::split_issue,
             commands::get_autostart,
             commands::set_autostart,
             commands::statuses,

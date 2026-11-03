@@ -5,6 +5,8 @@ import {
   BookOpenCheck,
   CornerUpLeft,
   ExternalLink,
+  GitFork,
+  ListTree,
   MessageCircleQuestion,
   Paperclip,
   Pause,
@@ -45,6 +47,7 @@ export function IssueDetail({
   onRefresh,
   onResolve,
   onFollowUp,
+  onSplit,
   onClose,
   hideAi,
 }: {
@@ -53,6 +56,8 @@ export function IssueDetail({
   onRefresh: () => void;
   onResolve: () => void;
   onFollowUp: () => void;
+  /** 拆分为子任务，分给不同的人 */
+  onSplit?: () => void;
   /** 在看板抽屉中显示时提供关闭按钮 */
   onClose?: () => void;
   /** 不在收件箱中的任务（如项目总览）不显示 AI 分析 */
@@ -235,6 +240,8 @@ export function IssueDetail({
             )}
           </div>
 
+          {detail.children.length > 0 && <Children detail={detail} />}
+
           {is.attachments.length > 0 && (
             <div className="mt-6">
               <SectionTitle icon={<Paperclip className="size-3.5" />}>附件 {is.attachments.length}</SectionTitle>
@@ -318,6 +325,11 @@ export function IssueDetail({
           </Button>
         )}
         <div className="flex-1" />
+        {onSplit && (
+          <Button variant="ghost" icon={<GitFork className="size-4" />} onClick={onSplit} title="把问题的不同部分拆成子任务，分给不同的人 (S)">
+            拆分
+          </Button>
+        )}
         <Button icon={<MessageCircleQuestion className="size-4" />} onClick={onFollowUp}>
           追问提出人
         </Button>
@@ -325,6 +337,47 @@ export function IssueDetail({
           处理 · 回派给 {v.authorName || "提出人"}
           <Kbd>R</Kbd>
         </Button>
+      </div>
+    </div>
+  );
+}
+
+function Children({ detail }: { detail: Detail }) {
+  const done = detail.children.filter((c) => c.closed).length;
+  const total = detail.children.length;
+  const urlOf = (id: number) => detail.webUrl.replace(/\/issues\/\d+$/, `/issues/${id}`);
+  return (
+    <div className="mt-6">
+      <SectionTitle icon={<ListTree className="size-3.5" />}>
+        子任务 {done}/{total} 已完成
+      </SectionTitle>
+      <div className="divide-y divide-line overflow-hidden rounded-xl border border-line bg-panel">
+        {detail.children.map((c) => (
+          <button
+            key={c.id}
+            onClick={() => void api.openUrl(urlOf(c.id))}
+            title="在浏览器中打开"
+            className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left hover:bg-hover"
+          >
+            <span className="font-mono text-[12px] text-ink-3">#{c.id}</span>
+            <span className={clsx("min-w-0 flex-1 truncate text-[13px]", c.closed && "text-ink-3 line-through")}>{c.subject}</span>
+            {c.assignee ? (
+              <span className="flex shrink-0 items-center gap-1.5 text-[12px] text-ink-2">
+                <Avatar name={c.assignee} size={16} />
+                {c.assignee}
+              </span>
+            ) : (
+              <span className="shrink-0 text-[12px] text-warn">未指派</span>
+            )}
+            {c.status && <Badge tone={c.closed ? "ok" : "muted"}>{c.status}</Badge>}
+            <span className="flex w-16 shrink-0 items-center gap-1.5">
+              <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-line">
+                <span className="block h-full rounded-full bg-ok" style={{ width: `${c.closed ? 100 : c.doneRatio}%` }} />
+              </span>
+              <span className="w-7 text-right text-[11px] text-ink-3 tabular-nums">{c.closed ? 100 : c.doneRatio}%</span>
+            </span>
+          </button>
+        ))}
       </div>
     </div>
   );

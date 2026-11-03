@@ -60,6 +60,32 @@ pub struct Issue {
     /// 目标版本（里程碑）
     #[serde(default, alias = "fixed_version")]
     pub fixed_version: Option<NamedId>,
+    #[serde(default, alias = "custom_fields")]
+    pub custom_fields: Vec<CustomFieldValue>,
+    /// 子任务（`include=children`，只有 ID、跟踪和标题）
+    #[serde(default)]
+    pub children: Vec<ChildRef>,
+}
+
+/// 自定义字段的值；拆分子任务时沿用父任务的值，避免必填字段校验失败
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomFieldValue {
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildRef {
+    pub id: u64,
+    #[serde(default)]
+    pub tracker: Option<NamedId>,
+    #[serde(default)]
+    pub subject: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +240,20 @@ pub struct IssueDetail {
     pub issue: Issue,
     pub similar: Vec<SimilarIssue>,
     pub web_url: String,
+    /// 子任务的当前状态与负责人
+    pub children: Vec<ChildIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildIssue {
+    pub id: u64,
+    pub subject: String,
+    pub tracker: String,
+    pub status: String,
+    pub closed: bool,
+    pub assignee: String,
+    pub done_ratio: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +485,49 @@ pub struct AssignSuggestion {
 pub struct AssignItem {
     pub issue_id: u64,
     pub assignee_id: u64,
+}
+
+/// 拆分出的一个子任务。提交时只用到前五个字段，其余字段是推荐结果附带的说明
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SplitPart {
+    pub subject: String,
+    pub description: String,
+    pub assignee_id: Option<u64>,
+    /// 为空时沿用原任务的类别
+    pub category_id: Option<u64>,
+    pub estimated_hours: Option<f64>,
+    pub assignee_name: String,
+    pub reason: String,
+    /// ai | category | history | workload
+    pub source: String,
+}
+
+/// 拆分建议，同时带上拆分界面需要的成员、类别和负载
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitSuggestion {
+    pub issue_id: u64,
+    pub subject: String,
+    pub description: String,
+    pub category: Option<String>,
+    pub parts: Vec<SplitPart>,
+    /// 无法给出建议或需要提醒时的说明
+    pub hint: Option<String>,
+    pub members: Vec<Assignee>,
+    pub categories: Vec<NamedId>,
+    /// (成员 ID, 当前负责的未关闭任务数)
+    pub load: Vec<(u64, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitOutcome {
+    pub issue_id: u64,
+    pub created: Vec<ChildIssue>,
+    /// 未能创建的子任务：“标题：原因”
+    pub failed: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// 可指派的项目成员

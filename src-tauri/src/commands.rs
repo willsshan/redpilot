@@ -264,6 +264,16 @@ pub async fn bulk_assign(state: State<'_, AppState>, items: Vec<AssignItem>, not
 }
 
 #[tauri::command]
+pub async fn suggest_split(state: State<'_, AppState>, issue_id: u64, use_ai: bool) -> CmdResult<SplitSuggestion> {
+    state.svc.suggest_split(issue_id, use_ai).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn split_issue(state: State<'_, AppState>, issue_id: u64, parts: Vec<SplitPart>, add_note: bool) -> CmdResult<SplitOutcome> {
+    state.svc.split_issue(issue_id, &parts, add_note).await.map_err(e)
+}
+
+#[tauri::command]
 pub fn recent_changes(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec<IssueChange>> {
     state.svc.recent_changes(limit).map_err(e)
 }

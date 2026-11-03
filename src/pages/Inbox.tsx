@@ -9,6 +9,7 @@ import { Avatar, Badge, Button, CategoryBadge, Empty, Kbd } from "../components/
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
 import { Board, type GroupBy } from "../components/Board";
+import { SplitDialog } from "../components/SplitDialog";
 
 type Quick = "all" | "unread" | "changed" | "overdue" | "missing";
 type View = "list" | "board";
@@ -96,6 +97,7 @@ export function InboxPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [resolveFor, setResolveFor] = useState<IssueView[] | null>(null);
   const [followUp, setFollowUp] = useState(false);
+  const [splitFor, setSplitFor] = useState<number | null>(null);
   const [analyzingAll, setAnalyzingAll] = useState(false);
   const [view, setViewState] = useState<View>(() => stored("rp.inbox.view", ["list", "board"] as const, "list"));
   const [groupBy, setGroupByState] = useState<GroupBy>(() => stored("rp.board.group", ["status", "category", "project", "urgency"] as const, "status"));
@@ -249,13 +251,16 @@ export function InboxPage() {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
-      if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || resolveFor || followUp) return;
+      if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || resolveFor || followUp || splitFor !== null) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (view === "board") {
         if (e.key === "Escape" && drawer) setDrawer(false);
         else if (e.key === "r" && drawer && current) {
           e.preventDefault();
           setResolveFor([current]);
+        } else if (e.key === "s" && drawer && current) {
+          e.preventDefault();
+          setSplitFor(current.id);
         } else if (e.key === "/") {
           e.preventDefault();
           searchRef.current?.focus();
@@ -281,6 +286,9 @@ export function InboxPage() {
         setChecked(new Set());
       } else if (e.key === "x" && current) {
         toggleCheck(current.id);
+      } else if (e.key === "s" && current) {
+        e.preventDefault();
+        setSplitFor(current.id);
       }
     };
     window.addEventListener("keydown", h);
@@ -500,6 +508,7 @@ export function InboxPage() {
                   onRefresh={() => void loadDetail(current.id, true)}
                   onResolve={() => setResolveFor([current])}
                   onFollowUp={() => setFollowUp(true)}
+                  onSplit={() => setSplitFor(current.id)}
                   onClose={() => setDrawer(false)}
                 />
               </div>
@@ -618,9 +627,10 @@ export function InboxPage() {
               onRefresh={() => void loadDetail(current.id, true)}
               onResolve={() => setResolveFor([current])}
               onFollowUp={() => setFollowUp(true)}
+              onSplit={() => setSplitFor(current.id)}
             />
           ) : (
-            loaded && <Empty icon={<Check className="size-6" />} title="选择一个任务查看详情" desc={<>用 <Kbd>J</Kbd> <Kbd>K</Kbd> 上下切换，<Kbd>X</Kbd> 多选，<Kbd>R</Kbd> 回派</>} />
+            loaded && <Empty icon={<Check className="size-6" />} title="选择一个任务查看详情" desc={<>用 <Kbd>J</Kbd> <Kbd>K</Kbd> 上下切换，<Kbd>X</Kbd> 多选，<Kbd>R</Kbd> 回派，<Kbd>S</Kbd> 拆分</>} />
           )}
         </div>
       </div>
@@ -633,6 +643,7 @@ export function InboxPage() {
         allowedStatuses={resolveFor?.length === 1 && detail?.view.id === resolveFor[0].id ? detail.issue.allowedStatuses : undefined}
       />
       <FollowUpDialog open={followUp} onClose={() => setFollowUp(false)} issue={current} />
+      <SplitDialog issueId={splitFor} onClose={() => setSplitFor(null)} onDone={() => current && void loadDetail(current.id, true)} />
     </div>
   );
 }

@@ -105,6 +105,17 @@ export interface IssueDetail {
   issue: Issue;
   similar: SimilarIssue[];
   webUrl: string;
+  children: ChildIssue[];
+}
+
+export interface ChildIssue {
+  id: number;
+  subject: string;
+  tracker: string;
+  status: string;
+  closed: boolean;
+  assignee: string;
+  doneRatio: number;
 }
 
 export interface IssueFilter {
@@ -240,6 +251,38 @@ export interface AssignSuggestion {
   assigneeName: string;
   reason: string;
   source: "ai" | "category" | "history" | "workload";
+}
+
+export interface SplitPart {
+  subject: string;
+  description: string;
+  assigneeId?: number | null;
+  /** 为空时沿用原任务的类别 */
+  categoryId?: number | null;
+  estimatedHours?: number | null;
+  assigneeName?: string;
+  reason?: string;
+  source?: AssignSuggestion["source"] | "";
+}
+
+export interface SplitSuggestion {
+  issueId: number;
+  subject: string;
+  description: string;
+  category?: string | null;
+  parts: SplitPart[];
+  hint?: string | null;
+  members: Assignee[];
+  categories: NamedId[];
+  /** [成员 ID, 当前未关闭任务数] */
+  load: [number, number][];
+}
+
+export interface SplitOutcome {
+  issueId: number;
+  created: ChildIssue[];
+  failed: string[];
+  warnings: string[];
 }
 
 export interface StagedFile {
@@ -402,6 +445,8 @@ export const api = {
     invoke<AssignSuggestion[]>("suggest_assignments", { projectId, issueIds, useAi }),
   bulkAssign: (items: { issueId: number; assigneeId: number }[], notes: string | null) =>
     invoke<ResolveOutcome[]>("bulk_assign", { items, notes }),
+  suggestSplit: (issueId: number, useAi: boolean) => invoke<SplitSuggestion>("suggest_split", { issueId, useAi }),
+  splitIssue: (issueId: number, parts: SplitPart[], addNote: boolean) => invoke<SplitOutcome>("split_issue", { issueId, parts, addNote }),
   recentChanges: (limit = 30) => invoke<IssueChange[]>("recent_changes", { limit }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),

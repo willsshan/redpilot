@@ -2,11 +2,11 @@
 
 use crate::ai::{AiClient, Message, Usage};
 use crate::analysis::{self, Corpus};
-use crate::config::{self, AppConfig, Paths};
+use crate::config::{self, AppConfig, Paths, TextFormat};
 use crate::db::{self, Db, PrevIssue};
 use crate::models::*;
 use crate::project;
-use crate::redmine::{truncate, IssueCategory, IssueQuery, IssueUpdate, RedmineClient};
+use crate::redmine::{truncate, IssueCategory, IssueQuery, IssueUpdate, NewIssue, RedmineClient};
 use crate::secrets::{SecretKind, SecretStore};
 use crate::{coded, mask, prompts};
 use anyhow::{anyhow, Context, Result};
@@ -535,7 +535,36 @@ impl Service {
         };
         let similar = self.find_similar(id, 5).unwrap_or_default();
         let web_url = self.redmine().map(|r| r.issue_url(id)).unwrap_or_default();
-        Ok(IssueDetail { view, issue, similar, web_url })
+        let children = if issue.children.is_empty() {
+            vec![]
+        } else {
+            self.child_issues(id).await.unwrap_or_else(|e| {
+                tracing::warn!("读取 #{id} 的子任务失败: {e}");
+                issue
+                    .children
+                    .iter()
+                    .map(|c| ChildIssue {
+                        id: c.id,
+                        subject: c.subject.clone(),
+                        tracker: c.tracker.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+        };
+        Ok(IssueDetail { view, issue, similar, web_url, children })
+    }
+
+    /// 子任务的当前状态（详情缓存里只有子任务的 ID 和标题）
+    async fn child_issues(&self, id: u64) -> Result<Vec<ChildIssue>> {
+        let list = self
+            .redmine()?
+            .list_issues(&IssueQuery { status: "*".into(), extra: vec![("parent_id", id.to_string())], max_results: 100, ..Default::default() })
+            .await?;
+        let statuses = self.statuses().await.unwrap_or_default();
+        let mut out: Vec<ChildIssue> = list.iter().map(|c| child_issue(c, &statuses)).collect();
+        out.sort_by_key(|c| c.id);
+        Ok(out)
     }
 
     pub fn find_similar(&self, id: u64, limit: usize) -> Result<Vec<SimilarIssue>> {
@@ -1295,12 +1324,23 @@ impl Service {
                 None => targets.push(project::to_project_issue(&rm.get_issue(*id).await?, today)),
             }
         }
-        let categories = rm.issue_categories(project_id).await.unwrap_or_default();
+        let (categories, refs, load) = self.assign_refs(&rm, &ov).await;
+        let local = project::local_suggestions(&targets, &refs, &ov.members, &categories, &load);
+        if !use_ai {
+            return Ok(local);
+        }
+        self.ai_assign(project_id, &targets, &ov, &categories, &load, local).await
+    }
+
+    /// 推荐负责人用到的参考数据：类别、参考任务（谁处理过什么）、每个成员当前的未关闭任务数
+    async fn assign_refs(&self, rm: &RedmineClient, ov: &ProjectOverview) -> (Vec<IssueCategory>, Vec<ProjectIssue>, HashMap<u64, usize>) {
+        let today = chrono::Local::now().date_naive();
+        let categories = rm.issue_categories(ov.project_id).await.unwrap_or_default();
         // 近 120 天关闭、且没有回派给提出人的任务，反映谁处理过什么
         let since = (today - chrono::Duration::days(120)).format("%Y-%m-%d").to_string();
         let closed = rm
             .list_issues(&IssueQuery {
-                project: Some(project_id.to_string()),
+                project: Some(ov.project_id.to_string()),
                 status: "closed".into(),
                 updated_since: Some(since),
                 max_results: 500,
@@ -1321,11 +1361,7 @@ impl Service {
                 *load.entry(a).or_default() += 1;
             }
         }
-        let local = project::local_suggestions(&targets, &refs, &ov.members, &categories, &load);
-        if !use_ai {
-            return Ok(local);
-        }
-        self.ai_assign(project_id, &targets, &ov, &categories, &load, local).await
+        (categories, refs, load)
     }
 
     async fn ai_assign(
@@ -1346,24 +1382,7 @@ impl Service {
         if cands.is_empty() {
             return Ok(local);
         }
-        let mut body = String::from("项目成员：\n");
-        for c in &cands {
-            let own: Vec<String> = ov
-                .issues
-                .iter()
-                .filter(|i| i.assignee_id == Some(c.id))
-                .take(6)
-                .map(|i| format!("#{} {}", i.id, truncate(&i.subject, 30)))
-                .collect();
-            body.push_str(&format!(
-                "- [{}] {}（{}）当前未关闭 {} 个；正在负责：{}\n",
-                c.id,
-                c.name,
-                if c.roles.is_empty() { "角色未知".into() } else { c.roles.join("、") },
-                load.get(&c.id).copied().unwrap_or(0),
-                if own.is_empty() { "无".into() } else { own.join("；") }
-            ));
-        }
+        let mut body = members_brief(&cands, ov, load);
         let defaults: Vec<String> = categories
             .iter()
             .filter_map(|c| c.assigned_to.as_ref().map(|a| format!("{} → {}", c.name, a.name)))
@@ -1450,6 +1469,267 @@ impl Service {
         outs.into_iter().map(|(_, o)| o).collect()
     }
 
+    // ---------------- 拆分任务 ----------------
+
+    /// 拆分建议：默认把描述里分条列出的事项按推荐负责人分组；`use_ai` 时由 AI 按分工拆分
+    pub async fn suggest_split(&self, issue_id: u64, use_ai: bool) -> Result<SplitSuggestion> {
+        let rm = self.redmine()?;
+        let parent = rm.get_issue(issue_id).await?;
+        let pi = project::to_project_issue(&parent, chrono::Local::now().date_naive());
+        let ov = match self.project_overview(parent.project.id, false).await {
+            Ok(ov) => ov,
+            Err(e) => {
+                // 读不了全项目任务时，仍然给出成员列表，可以手动拆分
+                tracing::warn!("读取项目 {} 的任务失败: {e}", parent.project.id);
+                ProjectOverview {
+                    project_id: parent.project.id,
+                    fetched_at: db::now_rfc3339(),
+                    issues: vec![],
+                    truncated: false,
+                    members: self.assignees(parent.project.id).await.unwrap_or_default(),
+                    versions: vec![],
+                    weekly: vec![],
+                }
+            }
+        };
+        let (categories, refs, load) = self.assign_refs(&rm, &ov).await;
+        let items = project::split_items(parent.description.as_deref().unwrap_or(""));
+        let local = if items.len() >= 2 {
+            project::local_split(&pi, &items, &refs, &ov.members, &categories, &load)
+        } else {
+            vec![]
+        };
+        let mut hint = None;
+        let parts = if use_ai {
+            let parts = self.ai_split(&parent, &ov, &categories, &refs, &load, &local).await?;
+            if parts.len() == 1 {
+                hint = Some("AI 认为这个问题由一个人处理即可（理由见下方），如仍需拆分可以手动添加".into());
+            }
+            parts
+        } else {
+            if items.len() < 2 {
+                hint = Some("描述里没有分条列出的事项，可以点“AI 拆分”，或手动添加子任务".into());
+            } else if local.len() == 1 {
+                hint = Some("这些条目都推荐给了同一个人；如需分工，可以点“AI 拆分”或手动调整".into());
+            }
+            local
+        };
+        let mut load_list: Vec<(u64, usize)> = load.into_iter().collect();
+        load_list.sort();
+        Ok(SplitSuggestion {
+            issue_id,
+            subject: parent.subject.clone(),
+            description: parent.description.clone().unwrap_or_default(),
+            category: parent.category.as_ref().map(|c| c.name.clone()),
+            parts,
+            hint,
+            members: ov.members.clone(),
+            categories: categories.iter().map(|c| NamedId { id: c.id, name: c.name.clone(), is_closed: None }).collect(),
+            load: load_list,
+        })
+    }
+
+    async fn ai_split(
+        &self,
+        parent: &Issue,
+        ov: &ProjectOverview,
+        categories: &[IssueCategory],
+        refs: &[ProjectIssue],
+        load: &HashMap<u64, usize>,
+        local: &[SplitPart],
+    ) -> Result<Vec<SplitPart>> {
+        let cfg = self.config();
+        if cfg.ai.excluded_project_ids.contains(&parent.project.id) {
+            return Err(coded("AI_EXCLUDED", "该项目已设置为不发送给 AI，请按条目拆分或手动添加"));
+        }
+        let ai = self.ai_client(true)?;
+        let cands = project::candidates(&ov.members);
+        if cands.is_empty() {
+            return Err(coded("NO_MEMBERS", "无法读取项目成员，请手动拆分"));
+        }
+        let mut body = members_brief(&cands, ov, load);
+        if !categories.is_empty() {
+            let list: Vec<String> = categories
+                .iter()
+                .map(|c| match &c.assigned_to {
+                    Some(a) => format!("[{}] {}（默认负责人 {}）", c.id, c.name, a.name),
+                    None => format!("[{}] {}", c.id, c.name),
+                })
+                .collect();
+            body.push_str(&format!("\n可选类别（categoryId）：{}\n", list.join("；")));
+        }
+        if !local.is_empty() {
+            body.push_str("\n本地算法按条目给出的分工（仅供参考）：\n");
+            for p in local {
+                body.push_str(&format!("- {} → {}（{}）\n", p.subject, p.assignee_name, p.reason));
+            }
+        }
+        body.push_str(&format!(
+            "\n待拆分问题：#{} [{} / {} / {}] 优先级：{} 截止：{}\n标题：{}\n描述：\n{}\n",
+            parent.id,
+            parent.tracker.as_ref().map(|t| t.name.as_str()).unwrap_or("-"),
+            parent.category.as_ref().map(|c| c.name.as_str()).unwrap_or("无类别"),
+            parent.fixed_version.as_ref().map(|v| v.name.as_str()).unwrap_or("无版本"),
+            parent.priority.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
+            parent.due_date.as_deref().unwrap_or("-"),
+            parent.subject,
+            truncate(parent.description.as_deref().unwrap_or("（无描述）"), 3000),
+        ));
+        let notes: Vec<String> = parent
+            .journals
+            .iter()
+            .filter_map(|j| {
+                let n = j.notes.as_deref()?.trim();
+                (!n.is_empty() && j.private_notes != Some(true))
+                    .then(|| format!("- {}：{}", j.user.as_ref().map(|u| u.name.as_str()).unwrap_or("?"), truncate(n, 300)))
+            })
+            .collect();
+        if !notes.is_empty() {
+            let start = notes.len().saturating_sub(5);
+            body.push_str(&format!("\n后续沟通（最近 5 条）：\n{}\n", notes[start..].join("\n")));
+        }
+        let msgs = vec![
+            Message::system(prompts::with_extra(prompts::split_system(), &cfg.ai.custom_prompts.plan)),
+            Message::user(self.prep_for_ai(&body)),
+        ];
+        let (v, usage) = ai.chat_json::<Value>(&msgs).await?;
+        self.record_usage("split", &ai.model, usage);
+
+        let mut parts = Vec::new();
+        for item in v["parts"].as_array().cloned().unwrap_or_default().into_iter().take(10) {
+            let Some(subject) = v_str(&item["subject"]) else { continue };
+            let description = v_str(&item["description"]).unwrap_or_default();
+            let category_id = v_u64(&item["categoryId"]).filter(|id| categories.iter().any(|c| c.id == *id));
+            let estimated_hours = v_f64(&item["estimatedHours"]).filter(|h| *h > 0.0 && *h < 1000.0);
+            let reason = v_str(&item["reason"]).unwrap_or_else(|| "AI 推荐".into());
+            let mut part = match v_u64(&item["assigneeId"]).and_then(|id| cands.iter().find(|c| c.id == id)) {
+                Some(c) => SplitPart { assignee_id: Some(c.id), assignee_name: c.name.clone(), reason, source: "ai".into(), ..Default::default() },
+                None => {
+                    // AI 给的人不在成员列表里：这一部分改用本地算法推荐
+                    let t = ProjectIssue { subject: subject.clone(), description: description.clone(), ..Default::default() };
+                    let s = project::local_suggestions(&[t], refs, &ov.members, categories, load).remove(0);
+                    SplitPart {
+                        assignee_id: s.assignee_id,
+                        assignee_name: s.assignee_name,
+                        reason: format!("AI 没有给出有效人选，按历史推荐：{}", s.reason),
+                        source: s.source,
+                        ..Default::default()
+                    }
+                }
+            };
+            part.subject = truncate(&subject, 120);
+            part.description = description;
+            part.category_id = category_id;
+            part.estimated_hours = estimated_hours;
+            parts.push(part);
+        }
+        if parts.is_empty() {
+            return Err(coded("AI_EMPTY", "AI 没有给出有效的拆分方案，请重试或手动拆分"));
+        }
+        Ok(parts)
+    }
+
+    /// 创建子任务并分别指派。逐个创建，单个失败不影响其他；可选在原任务添加拆分说明。
+    pub async fn split_issue(&self, issue_id: u64, parts: &[SplitPart], add_note: bool) -> Result<SplitOutcome> {
+        let parts: Vec<&SplitPart> = parts.iter().filter(|p| !p.subject.trim().is_empty()).collect();
+        if parts.is_empty() {
+            return Err(coded("SPLIT_EMPTY", "请至少填写一个子任务标题"));
+        }
+        if parts.len() > 20 {
+            return Err(coded("SPLIT_TOO_MANY", "一次最多拆分 20 个子任务"));
+        }
+        let rm = self.redmine()?;
+        let parent = rm.get_issue(issue_id).await?;
+        let statuses = self.statuses().await.unwrap_or_default();
+        let members = self.assignees(parent.project.id).await.unwrap_or_default();
+        let custom: Vec<(u64, Value)> = parent
+            .custom_fields
+            .iter()
+            .filter(|c| !(c.value.is_null() || c.value.as_str() == Some("") || c.value.as_array().is_some_and(|a| a.is_empty())))
+            .map(|c| (c.id, c.value.clone()))
+            .collect();
+        let mut out = SplitOutcome { issue_id, ..Default::default() };
+        // 同一批子任务的跟踪类型相同：父任务字段或自定义字段被拒绝一次后，后面的不再带上
+        let mut as_subtask = true;
+        let mut with_custom = true;
+        for p in parts {
+            let mut n = NewIssue {
+                project_id: parent.project.id,
+                tracker_id: parent.tracker.as_ref().map(|t| t.id),
+                priority_id: parent.priority.as_ref().map(|t| t.id),
+                parent_issue_id: as_subtask.then_some(issue_id),
+                subject: p.subject.trim().to_string(),
+                description: p.description.trim().to_string(),
+                assigned_to_id: p.assignee_id,
+                category_id: p.category_id.or(parent.category.as_ref().map(|c| c.id)),
+                fixed_version_id: parent.fixed_version.as_ref().map(|v| v.id),
+                due_date: parent.due_date.clone(),
+                estimated_hours: p.estimated_hours,
+                custom_fields: if with_custom { custom.clone() } else { vec![] },
+            };
+            let mut res = rm.create_issue(&n).await;
+            // 有的跟踪类型禁用了“父任务”字段，或沿用的自定义字段值对新任务无效：去掉后重试一次
+            if let Err(e) = &res {
+                let msg = plain_error(e);
+                let parent_bad = n.parent_issue_id.is_some() && (msg.contains("父任务") || msg.to_lowercase().contains("parent"));
+                let cf_bad = !n.custom_fields.is_empty() && parent.custom_fields.iter().any(|c| !c.name.is_empty() && msg.contains(&c.name));
+                if parent_bad {
+                    n.parent_issue_id = None;
+                    as_subtask = false;
+                    out.warnings.push(format!("无法设为子任务（{msg}），已改为与 #{issue_id} 建立“相关”关联"));
+                }
+                if cf_bad {
+                    n.custom_fields.clear();
+                    with_custom = false;
+                    out.warnings.push("沿用的自定义字段值对子任务无效，子任务未设置自定义字段".into());
+                }
+                if parent_bad || cf_bad {
+                    res = rm.create_issue(&n).await;
+                }
+            }
+            match res {
+                Ok(child) => {
+                    if n.parent_issue_id.is_none() {
+                        if let Err(e) = rm.create_relation(issue_id, child.id, "relates").await {
+                            out.warnings.push(format!("#{} 关联到 #{issue_id} 失败：{}", child.id, plain_error(&e)));
+                        }
+                    }
+                    let mut c = child_issue(&child, &statuses);
+                    if c.assignee.is_empty() {
+                        if let Some(m) = p.assignee_id.and_then(|id| members.iter().find(|m| m.id == id)) {
+                            c.assignee = m.name.clone();
+                        }
+                    }
+                    out.created.push(c);
+                }
+                Err(e) => out.failed.push(format!("{}：{}", truncate(p.subject.trim(), 40), plain_error(&e))),
+            }
+        }
+
+        if add_note && !out.created.is_empty() {
+            let bullet = match self.config().redmine.text_format {
+                TextFormat::Textile => "*",
+                TextFormat::Markdown => "-",
+            };
+            let mut note = format!("已拆分为 {} 个子任务：\n\n", out.created.len());
+            for c in &out.created {
+                let who = if c.assignee.is_empty() { "未指派" } else { c.assignee.as_str() };
+                note.push_str(&format!("{bullet} #{} {}（{who}）\n", c.id, c.subject));
+            }
+            match rm.update_issue(issue_id, &IssueUpdate { notes: Some(note), ..Default::default() }).await {
+                Ok(()) => {
+                    if let Ok(fresh) = rm.get_issue(issue_id).await {
+                        self.db.apply_own_update(&fresh)?;
+                    }
+                }
+                Err(e) => out.warnings.push(format!("在原任务添加拆分说明失败：{}", plain_error(&e))),
+            }
+        }
+        write(&self.overviews, HashMap::new());
+        self.emit(AppEvent::IssuesChanged);
+        Ok(out)
+    }
+
     // ---------------- 统计与报告 ----------------
 
     pub fn stats(&self) -> Result<Stats> {
@@ -1526,6 +1806,54 @@ impl Service {
 }
 
 // ---------------- 工具函数 ----------------
+
+/// 给 AI 的成员说明：角色、当前负载、正在负责的任务（体现熟悉的模块）
+fn members_brief(cands: &[&Assignee], ov: &ProjectOverview, load: &HashMap<u64, usize>) -> String {
+    let mut body = String::from("项目成员：\n");
+    for c in cands {
+        let own: Vec<String> = ov
+            .issues
+            .iter()
+            .filter(|i| i.assignee_id == Some(c.id))
+            .take(6)
+            .map(|i| format!("#{} {}", i.id, truncate(&i.subject, 30)))
+            .collect();
+        body.push_str(&format!(
+            "- [{}] {}（{}）当前未关闭 {} 个；正在负责：{}\n",
+            c.id,
+            c.name,
+            if c.roles.is_empty() { "角色未知".into() } else { c.roles.join("、") },
+            load.get(&c.id).copied().unwrap_or(0),
+            if own.is_empty() { "无".into() } else { own.join("；") }
+        ));
+    }
+    body
+}
+
+/// 给用户看的错误信息，不带错误码
+fn plain_error(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<crate::CodedError>() {
+        Some(c) => c.message.clone(),
+        None => e.to_string(),
+    }
+}
+
+fn child_issue(is: &Issue, statuses: &[NamedId]) -> ChildIssue {
+    let closed = is
+        .status
+        .is_closed
+        .or_else(|| statuses.iter().find(|s| s.id == is.status.id).and_then(|s| s.is_closed))
+        .unwrap_or(false);
+    ChildIssue {
+        id: is.id,
+        subject: is.subject.clone(),
+        tracker: is.tracker.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+        status: is.status.name.clone(),
+        closed,
+        assignee: is.assigned_to.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+        done_ratio: is.done_ratio.unwrap_or(0),
+    }
+}
 
 #[derive(Default)]
 struct UpdatePlan {

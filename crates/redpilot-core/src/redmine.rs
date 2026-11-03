@@ -62,6 +62,23 @@ pub struct IssueUpdate {
     pub uploads: Vec<UploadRef>,
 }
 
+/// 新建任务（拆分子任务时使用）
+#[derive(Debug, Clone, Default)]
+pub struct NewIssue {
+    pub project_id: u64,
+    pub tracker_id: Option<u64>,
+    pub priority_id: Option<u64>,
+    pub parent_issue_id: Option<u64>,
+    pub subject: String,
+    pub description: String,
+    pub assigned_to_id: Option<u64>,
+    pub category_id: Option<u64>,
+    pub fixed_version_id: Option<u64>,
+    pub due_date: Option<String>,
+    pub estimated_hours: Option<f64>,
+    pub custom_fields: Vec<(u64, Value)>,
+}
+
 /// `/uploads.json` 返回的令牌，随任务更新一起提交后附件才会挂到任务上（令牌只能用一次）
 #[derive(Debug, Clone)]
 pub struct UploadRef {
@@ -262,7 +279,7 @@ impl RedmineClient {
         struct W {
             issue: Issue,
         }
-        let include = "journals,attachments,relations,watchers,allowed_statuses";
+        let include = "journals,attachments,relations,watchers,allowed_statuses,children";
         Ok(self
             .get::<W>(&format!("/issues/{id}.json"), &[("include", include.into())])
             .await?
@@ -368,6 +385,38 @@ impl RedmineClient {
             filename: filename.to_string(),
             content_type: content_type.map(str::to_string),
         })
+    }
+
+    pub async fn create_issue(&self, n: &NewIssue) -> Result<Issue> {
+        let mut issue = json!({ "project_id": n.project_id, "subject": truncate(n.subject.trim(), 255), "description": n.description });
+        let opt = |v: Option<u64>| v.map(|x| json!(x));
+        for (k, v) in [
+            ("tracker_id", opt(n.tracker_id)),
+            ("priority_id", opt(n.priority_id)),
+            ("parent_issue_id", opt(n.parent_issue_id)),
+            ("assigned_to_id", opt(n.assigned_to_id)),
+            ("category_id", opt(n.category_id)),
+            ("fixed_version_id", opt(n.fixed_version_id)),
+            ("due_date", n.due_date.as_ref().map(|d| json!(d))),
+            ("estimated_hours", n.estimated_hours.map(|h| json!(h))),
+        ] {
+            if let Some(v) = v {
+                issue[k] = v;
+            }
+        }
+        if !n.custom_fields.is_empty() {
+            let cf: Vec<Value> = n.custom_fields.iter().map(|(id, v)| json!({ "id": id, "value": v })).collect();
+            issue["custom_fields"] = json!(cf);
+        }
+        #[derive(Deserialize)]
+        struct W {
+            issue: Issue,
+        }
+        let v = self
+            .request(Method::POST, "/issues.json", &[], Some(json!({ "issue": issue })))
+            .await?
+            .ok_or_else(|| anyhow!("Redmine 没有返回新建的任务"))?;
+        Ok(serde_json::from_value::<W>(v)?.issue)
     }
 
     pub async fn create_time_entry(&self, issue_id: u64, hours: f64, activity_id: Option<u64>, comments: &str) -> Result<()> {

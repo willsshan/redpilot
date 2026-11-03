@@ -5,7 +5,7 @@
 //!
 //! 写操作（回派、追问、备注、改状态、建关联）默认关闭，需在设置中打开“允许外部 AI 写操作”。
 
-use crate::models::{AssignItem, IssueFilter, IssueView, ResolveRequest};
+use crate::models::{AssignItem, IssueFilter, IssueView, ResolveRequest, SplitPart};
 use crate::service::Service;
 use anyhow::Result;
 use axum::extract::State;
@@ -226,6 +226,38 @@ pub struct BulkAssignItem {
     pub assignee_id: u64,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SuggestSplitParams {
+    pub issue_id: u64,
+    /// 用 AI 按分工拆分（默认 false：把描述中分条列出的事项按推荐负责人分组）
+    #[serde(default)]
+    pub use_ai: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SplitIssueParams {
+    /// 要拆分的原任务
+    pub issue_id: u64,
+    pub parts: Vec<SplitPartParam>,
+    /// 在原任务添加一条拆分说明，列出各子任务和负责人（默认 true）
+    #[serde(default = "default_true")]
+    pub add_note: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SplitPartParam {
+    pub subject: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub assignee_id: Option<u64>,
+    /// 为空时沿用原任务的类别
+    #[serde(default)]
+    pub category_id: Option<u64>,
+    #[serde(default)]
+    pub estimated_hours: Option<f64>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 #[serde(default)]
 pub struct ChangesParams {
@@ -375,6 +407,7 @@ impl RedPilotMcp {
             "attachments": attachments,
             "allowedStatuses": d.issue.allowed_statuses,
             "relations": d.issue.relations,
+            "children": d.children,
             "similarIssues": d.similar,
         }))
     }
@@ -499,6 +532,30 @@ impl RedPilotMcp {
         to_json(&self.svc.bulk_assign(&items, p.notes).await)
     }
 
+    #[tool(description = "为一个任务给出拆分方案：问题里的不同部分（如前端、后端、测试）分给不同的人。返回每个子任务的标题、内容、建议负责人和理由，以及项目成员、类别和成员负载，便于你自行调整。默认按描述中分条列出的事项和历史分工推荐，use_ai=true 时由 AI 拆分。只给建议，不修改 Redmine。")]
+    async fn suggest_split(&self, Parameters(p): Parameters<SuggestSplitParams>) -> ToolResult {
+        self.prepare();
+        to_json(&self.svc.suggest_split(p.issue_id, p.use_ai).await.map_err(err)?)
+    }
+
+    #[tool(description = "【写操作】把一个任务拆分为多个子任务并分别指派（子任务沿用原任务的项目、跟踪、优先级、版本、截止日期和自定义字段）。跟踪类型不允许子任务时改为“相关”关联。建议先用 suggest_split 生成方案并让用户确认。")]
+    async fn split_issue(&self, Parameters(p): Parameters<SplitIssueParams>) -> ToolResult {
+        self.ensure_write()?;
+        let parts: Vec<SplitPart> = p
+            .parts
+            .into_iter()
+            .map(|x| SplitPart {
+                subject: x.subject,
+                description: x.description,
+                assignee_id: x.assignee_id,
+                category_id: x.category_id,
+                estimated_hours: x.estimated_hours,
+                ..Default::default()
+            })
+            .collect();
+        to_json(&self.svc.split_issue(p.issue_id, &parts, p.add_note).await.map_err(err)?)
+    }
+
     #[tool(description = "根据处理要点起草规范的处置说明（问题原因/处理方法/处理结果/影响范围/验证建议），只生成不提交。多个任务时生成一份共用说明。")]
     async fn draft_resolution_note(&self, Parameters(p): Parameters<DraftNoteParams>) -> ToolResult {
         self.prepare();
@@ -608,9 +665,14 @@ impl ServerHandler for RedPilotMcp {
             .with_instructions(
                 "RedPilot 是用户的 Redmine 工单助手。典型流程：get_overview → sync_issues → list_issues / suggest_batches → \
                  get_issue 查看详情 → draft_resolution_note 起草说明 → 用户确认后 resolve_issue 回派给提出人。\
+                 一个问题需要多人分工（如前端、后端）时：suggest_split 生成方案 → 用户确认后 split_issue 创建子任务。\
                  写操作会直接修改 Redmine 并通知相关人员，执行前务必让用户确认内容。",
             )
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------- 传输层 ----------------

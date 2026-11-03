@@ -6,12 +6,42 @@ import { useToast } from "../lib/toast";
 import { modKey } from "../lib/format";
 import { Badge, Button, Modal, Select, Textarea } from "./ui";
 
-const SOURCE_LABEL: Record<AssignSuggestion["source"], string> = {
+export const SOURCE_LABEL: Record<AssignSuggestion["source"], string> = {
   ai: "AI",
   category: "类别负责人",
   history: "相似任务",
   workload: "负载最低",
 };
+
+export const sourceTone = (s: AssignSuggestion["source"]): "accent" | "ok" | "info" => (s === "ai" ? "accent" : s === "category" ? "ok" : "info");
+
+/** 成员下拉选项：用户（带当前未关闭数）和组 */
+export function MemberOptions({ members, load }: { members: Assignee[]; load: Map<number, number> }) {
+  const users = members.filter((m) => !m.isGroup);
+  const groups = members.filter((m) => m.isGroup);
+  return (
+    <>
+      {users.length > 0 && (
+        <optgroup label="成员（当前未关闭数）">
+          {users.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.name}（{load.get(m.id) ?? 0}）
+            </option>
+          ))}
+        </optgroup>
+      )}
+      {groups.length > 0 && (
+        <optgroup label="组">
+          {groups.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.name}
+            </option>
+          ))}
+        </optgroup>
+      )}
+    </>
+  );
+}
 
 /** 批量转派：每个任务可以指派给不同的人，支持“全部指派给某人”和按历史 / AI 推荐 */
 export function AssignDialog({
@@ -66,8 +96,6 @@ export function AssignDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, ids.join(",")]);
 
-  const users = members.filter((m) => !m.isGroup);
-  const groups = members.filter((m) => m.isGroup);
   const nameOf = (id: number | null | undefined) => members.find((m) => m.id === id)?.name ?? (id ? `成员 #${id}` : "");
   const changes = issues.filter((i) => {
     const t = targets.get(i.id);
@@ -115,28 +143,7 @@ export function AssignDialog({
     return () => window.removeEventListener("keydown", h);
   });
 
-  const memberOptions = (
-    <>
-      {users.length > 0 && (
-        <optgroup label="成员（当前未关闭数）">
-          {users.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.name}（{load.get(m.id) ?? 0}）
-            </option>
-          ))}
-        </optgroup>
-      )}
-      {groups.length > 0 && (
-        <optgroup label="组">
-          {groups.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.name}
-            </option>
-          ))}
-        </optgroup>
-      )}
-    </>
-  );
+  const memberOptions = <MemberOptions members={members} load={load} />;
 
   return (
     <Modal
@@ -226,7 +233,7 @@ export function AssignDialog({
                     <td className="px-3 py-2 text-[12px] text-ink-3">
                       {r && t === r.assigneeId ? (
                         <span className="line-clamp-2">
-                          <Badge tone={r.source === "ai" ? "accent" : r.source === "category" ? "ok" : "info"} className="mr-1">
+                          <Badge tone={sourceTone(r.source)} className="mr-1">
                             {SOURCE_LABEL[r.source]}
                           </Badge>
                           {r.reason}

@@ -11,7 +11,7 @@
 ![Rust](https://img.shields.io/badge/Rust-Tauri%202-orange?logo=rust)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
-![MCP](https://img.shields.io/badge/MCP-25%20tools-8e4ec6)
+![MCP](https://img.shields.io/badge/MCP-27%20tools-8e4ec6)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -51,6 +51,17 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 
 <p align="center">
   <img src="docs/screenshots/assign.png" width="760" alt="批量转派" />
+</p>
+
+### 🔀 拆分任务（一个问题，多人分工）
+- 一个问题里前几项要前端做、某几项要后端做时，按 <kbd>S</kbd> 或点“拆分”，把它拆成子任务分别指派
+- **按条目拆分**：自动识别描述里分条列出的事项（跳过“复现步骤”），按谁处理过类似任务推荐负责人，同一个人的条目合并；没有历史依据的按负载分给不同的人
+- **AI 拆分**：AI 读懂问题内容，结合成员角色、正在负责的任务和负载，按前端 / 后端 / 测试 / 数据等分工拆分，给出标题、内容、负责人、类别和预估工时
+- 子任务沿用原任务的项目、跟踪、优先级、版本、截止日期和自定义字段；可在原任务添加拆分说明，列出各子任务和负责人
+- 原任务详情显示子任务进度（负责人、状态、完成度）；跟踪类型不允许子任务时自动改为“相关”关联
+
+<p align="center">
+  <img src="docs/screenshots/split.png" width="760" alt="拆分任务" />
 </p>
 
 ### 🧠 AI 分析与分类
@@ -165,8 +176,8 @@ claude mcp add --transport http redpilot http://127.0.0.1:39217/mcp \
 | 类型 | 工具 |
 |---|---|
 | 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_recent_changes` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `list_assignees` · `draft_resolution_note` · `set_classification` · `work_report` |
-| 项目总览 | `list_my_projects` · `get_project_overview` · `suggest_assignments` |
-| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `bulk_assign` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
+| 项目总览 | `list_my_projects` · `get_project_overview` · `suggest_assignments` · `suggest_split` |
+| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `bulk_assign` · `split_issue` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
 
 写操作会直接修改 Redmine 并通知相关人员，需要在设置中手动开启“允许外部 AI 执行写操作”。通过 MCP 上传附件时，隐藏目录和 RedPilot 数据目录中的文件会被拒绝。
 
@@ -264,6 +275,7 @@ redpilot/
 - [x] MCP 服务（HTTP + stdio）
 - [x] 看板视图、⌘K 命令面板、回派附件、动态与到期提醒、开机自启（v0.2）
 - [x] 项目总览：版本进度、成员负载、多选一键转派（v0.2）
+- [x] 拆分任务：按条目或 AI 拆成子任务分给不同的人
 - [ ] 多服务器 / 多账号
 - [ ] 自动更新、安装包签名
 
