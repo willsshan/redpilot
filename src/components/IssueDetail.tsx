@@ -5,6 +5,7 @@ import {
   BookOpenCheck,
   CornerUpLeft,
   ExternalLink,
+  Forward,
   GitFork,
   ListTree,
   MessageCircleQuestion,
@@ -48,8 +49,10 @@ export function IssueDetail({
   onResolve,
   onFollowUp,
   onSplit,
+  onAssign,
   onClose,
   hideAi,
+  footer,
 }: {
   detail: Detail | null;
   loading: boolean;
@@ -58,10 +61,14 @@ export function IssueDetail({
   onFollowUp: () => void;
   /** 拆分为子任务，分给不同的人 */
   onSplit?: () => void;
+  /** 转派给其他成员（单人或多人） */
+  onAssign?: () => void;
   /** 在看板抽屉中显示时提供关闭按钮 */
   onClose?: () => void;
   /** 不在收件箱中的任务（如项目总览）不显示 AI 分析 */
   hideAi?: boolean;
+  /** 替换底部操作栏（分派台用派单栏） */
+  footer?: ReactNode;
 }) {
   const { config } = useApp();
   const toast = useToast();
@@ -307,6 +314,7 @@ export function IssueDetail({
       </div>
 
       {/* 底部操作栏 */}
+      {footer ?? (
       <div className="flex shrink-0 items-center gap-2 border-t border-line bg-panel/80 px-5 py-3 backdrop-blur">
         <button
           onClick={timer.toggle}
@@ -325,6 +333,11 @@ export function IssueDetail({
           </Button>
         )}
         <div className="flex-1" />
+        {onAssign && (
+          <Button variant="ghost" icon={<Forward className="size-4" />} onClick={onAssign} title="转派给其他成员，可以同时分给前端和后端 (T)">
+            转派
+          </Button>
+        )}
         {onSplit && (
           <Button variant="ghost" icon={<GitFork className="size-4" />} onClick={onSplit} title="把问题的不同部分拆成子任务，分给不同的人 (S)">
             拆分
@@ -338,6 +351,7 @@ export function IssueDetail({
           <Kbd>R</Kbd>
         </Button>
       </div>
+      )}
     </div>
   );
 }

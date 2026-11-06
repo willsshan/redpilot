@@ -10,6 +10,7 @@ import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
 import { AssignDialog } from "../components/AssignDialog";
 import { SplitDialog } from "../components/SplitDialog";
+import { DispatchDialog } from "../components/DispatchDialog";
 
 type Quick = "unassigned" | "overdue" | "stale" | "high" | null;
 type SortBy = "updated" | "created" | "due" | "priority";
@@ -53,6 +54,7 @@ export function ProjectPage() {
   const [resolveOpen, setResolveOpen] = useState(false);
   const [followUp, setFollowUp] = useState(false);
   const [splitFor, setSplitFor] = useState<number | null>(null);
+  const [dispatchFor, setDispatchFor] = useState<number | null>(null);
 
   const configured = !!config?.redmine.baseUrl && secrets.redmine;
 
@@ -178,11 +180,11 @@ export function ProjectPage() {
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && openId !== null && !resolveOpen && !followUp && !assignOpen && splitFor === null) setOpenId(null);
+      if (e.key === "Escape" && openId !== null && !resolveOpen && !followUp && !assignOpen && splitFor === null && dispatchFor === null) setOpenId(null);
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [openId, resolveOpen, followUp, assignOpen, splitFor]);
+  }, [openId, resolveOpen, followUp, assignOpen, splitFor, dispatchFor]);
 
   if (!configured) {
     return (
@@ -554,6 +556,7 @@ export function ProjectPage() {
               onResolve={() => setResolveOpen(true)}
               onFollowUp={() => setFollowUp(true)}
               onSplit={() => setSplitFor(openId)}
+              onAssign={() => setDispatchFor(openId)}
               onClose={() => setOpenId(null)}
             />
           </div>
@@ -586,6 +589,14 @@ export function ProjectPage() {
         onClose={() => setSplitFor(null)}
         onDone={() => {
           setChecked(new Set());
+          void load(true);
+          refreshDetail();
+        }}
+      />
+      <DispatchDialog
+        issueId={dispatchFor}
+        onClose={() => setDispatchFor(null)}
+        onDone={() => {
           void load(true);
           refreshDetail();
         }}

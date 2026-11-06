@@ -49,6 +49,9 @@ export interface IssueView {
   overdue: boolean;
   /** 上次查看之后的最新动态 */
   changeHint?: string | null;
+  /** Redmine 上的类别（区别于本地分类 analysis.category） */
+  redmineCategoryId?: number | null;
+  redmineCategory?: string | null;
   analysis: Analysis;
 }
 
@@ -250,7 +253,7 @@ export interface AssignSuggestion {
   assigneeId?: number | null;
   assigneeName: string;
   reason: string;
-  source: "ai" | "category" | "history" | "workload";
+  source: "ai" | "category" | "history" | "workload" | "role";
 }
 
 export interface SplitPart {
@@ -263,6 +266,8 @@ export interface SplitPart {
   assigneeName?: string;
   reason?: string;
   source?: AssignSuggestion["source"] | "";
+  /** 分工方向（前端、后端……） */
+  role?: string;
 }
 
 export interface SplitSuggestion {
@@ -321,6 +326,7 @@ export interface Stats {
   aiCost30d: number;
   aiCurrency: string;
   lastSyncAt?: string | null;
+  dispatchPending: number;
 }
 
 export interface ResolutionRecord {
@@ -356,6 +362,7 @@ export interface AppConfig {
     notifyChanges: boolean;
     notifyDue: boolean;
     autoAnalyze: boolean;
+    managedUnassigned: boolean;
   };
   workflow: {
     resolvedStatusId?: number | null;
@@ -382,6 +389,100 @@ export interface AppConfig {
   };
   mcp: { enabled: boolean; port: number; token: string; allowWrite: boolean };
   rules: { category: string; keywords: string[] }[];
+  dispatch: DispatchConfig;
+}
+
+export interface TeamMember {
+  id: number;
+  name: string;
+  role: string;
+}
+
+export interface DispatchConfig {
+  pendingStatusIds: number[];
+  projectIds: number[];
+  watch: boolean;
+  dueDays: { urgent: number; high: number; normal: number; low: number };
+  assignedStatusId?: number | null;
+  noteTemplate: string;
+  team: TeamMember[];
+}
+
+// ---------- 分派台 ----------
+
+export interface MultiPlan {
+  parts: SplitPart[];
+  reason: string;
+  source: "ai" | "role" | "history";
+}
+
+export interface DispatchItem {
+  issue: IssueView;
+  suggestion?: AssignSuggestion | null;
+  multi?: MultiPlan | null;
+  defaultDue?: string | null;
+  itemCount: number;
+}
+
+export interface DispatchMember {
+  id: number;
+  name: string;
+  isGroup: boolean;
+  roles: string[];
+  load: number;
+  role: string;
+  roleGuessed: boolean;
+  key?: number | null;
+}
+
+export interface DispatchProject {
+  id: number;
+  name: string;
+  members: DispatchMember[];
+  categories: NamedId[];
+  error?: string | null;
+}
+
+export interface DispatchQueue {
+  items: DispatchItem[];
+  projects: DispatchProject[];
+  meId?: number | null;
+  pendingStatuses: string[];
+}
+
+export interface DispatchRequest {
+  issueId: number;
+  mode: "single" | "split" | "assist";
+  assigneeId?: number | null;
+  collaboratorIds?: number[];
+  parts?: SplitPart[];
+  frontendWaits?: boolean;
+  notes?: string | null;
+  dueDate?: string | null;
+  autoDue?: boolean;
+  watch?: boolean | null;
+  statusId?: number | null;
+  categoryId?: number | null;
+  suggestedId?: number | null;
+}
+
+export interface DispatchOutcome {
+  issueId: number;
+  ok: boolean;
+  mode: string;
+  assignedTo: string[];
+  created: ChildIssue[];
+  warnings: string[];
+  error?: string | null;
+}
+
+export interface TeamCandidate {
+  id: number;
+  name: string;
+  projects: string[];
+  load: number;
+  guessedRole: string;
+  guessReason: string;
 }
 
 export interface SecretStatus {
@@ -447,6 +548,16 @@ export const api = {
     invoke<ResolveOutcome[]>("bulk_assign", { items, notes }),
   suggestSplit: (issueId: number, useAi: boolean) => invoke<SplitSuggestion>("suggest_split", { issueId, useAi }),
   splitIssue: (issueId: number, parts: SplitPart[], addNote: boolean) => invoke<SplitOutcome>("split_issue", { issueId, parts, addNote }),
+  dispatchQueue: () => invoke<DispatchQueue>("dispatch_queue"),
+  dispatchPreview: (issueId: number) => invoke<DispatchQueue>("dispatch_preview", { issueId }),
+  dispatchIssue: (req: DispatchRequest) => invoke<DispatchOutcome>("dispatch_issue", { req }),
+  dispatchBatch: (reqs: DispatchRequest[]) => invoke<DispatchOutcome[]>("dispatch_batch", { reqs }),
+  dispatchKeep: (issueId: number) => invoke<void>("dispatch_keep", { issueId }),
+  dispatchUnmark: (issueId: number) => invoke<void>("dispatch_unmark", { issueId }),
+  markDuplicate: (issueId: number, originalId: number, notes: string | null, statusId: number | null) =>
+    invoke<ResolveOutcome>("mark_duplicate", { issueId, originalId, notes, statusId }),
+  aiDispatch: (issueIds: number[]) => invoke<number>("ai_dispatch", { issueIds }),
+  dispatchTeam: () => invoke<TeamCandidate[]>("dispatch_team"),
   recentChanges: (limit = 30) => invoke<IssueChange[]>("recent_changes", { limit }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),

@@ -65,6 +65,14 @@ pub struct Issue {
     /// 子任务（`include=children`，只有 ID、跟踪和标题）
     #[serde(default)]
     pub children: Vec<ChildRef>,
+    /// 父任务（列表接口也会返回）
+    #[serde(default)]
+    pub parent: Option<ParentRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParentRef {
+    pub id: u64,
 }
 
 /// 自定义字段的值；拆分子任务时沿用父任务的值，避免必填字段校验失败
@@ -209,6 +217,9 @@ pub struct IssueView {
     pub overdue: bool,
     /// 上次查看之后的最新动态（如“张三 回复：…”），查看后清除
     pub change_hint: Option<String>,
+    /// Redmine 上的类别（区别于本地的分类 `analysis.category`）
+    pub redmine_category_id: Option<u64>,
+    pub redmine_category: Option<String>,
     pub analysis: Analysis,
 }
 
@@ -426,6 +437,8 @@ pub struct ProjectIssue {
     pub due_date: Option<String>,
     pub created_on: String,
     pub updated_on: String,
+    /// 父任务 ID
+    pub parent_id: Option<u64>,
     pub overdue: bool,
     /// 距上次更新的天数
     pub stale_days: i64,
@@ -499,8 +512,10 @@ pub struct SplitPart {
     pub estimated_hours: Option<f64>,
     pub assignee_name: String,
     pub reason: String,
-    /// ai | category | history | workload
+    /// ai | category | history | workload | role
     pub source: String,
+    /// 分工方向（前端、后端……），用于“前端等后端”的先后关系
+    pub role: String,
 }
 
 /// 拆分建议，同时带上拆分界面需要的成员、类别和负载
@@ -573,6 +588,8 @@ pub struct Stats {
     pub ai_cost_30d: f64,
     pub ai_currency: String,
     pub last_sync_at: Option<String>,
+    /// 分派台中等待分派的任务数
+    pub dispatch_pending: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,6 +603,130 @@ pub struct ResolutionRecord {
     pub spent_hours: Option<f64>,
     pub created_at: String,
     pub via: String,
+}
+
+// ---------------- 分派台 ----------------
+
+/// 分派台里的一个任务，带上推荐的负责人
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchItem {
+    pub issue: IssueView,
+    /// 单人推荐（有 AI 结果时优先用 AI 的）
+    pub suggestion: Option<AssignSuggestion>,
+    /// 看起来需要多人分工时的方案
+    pub multi: Option<MultiPlan>,
+    /// 任务没有截止日期时，按优先级给的默认截止日期
+    pub default_due: Option<String>,
+    /// 描述里分条列出的事项数
+    pub item_count: usize,
+}
+
+/// 多人分工方案：每人一个子任务
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MultiPlan {
+    pub parts: Vec<SplitPart>,
+    pub reason: String,
+    /// ai | role | history
+    pub source: String,
+}
+
+/// 分派时可选的成员
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchMember {
+    pub id: u64,
+    pub name: String,
+    pub is_group: bool,
+    pub roles: Vec<String>,
+    /// 在这个项目里负责的未关闭任务数
+    pub load: usize,
+    /// 分工方向（设置里标注的，或按历史推断的）
+    pub role: String,
+    /// 分工是按历史推断的，还没有在设置里确认
+    pub role_guessed: bool,
+    /// 数字键 1-9
+    pub key: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchProject {
+    pub id: u64,
+    pub name: String,
+    pub members: Vec<DispatchMember>,
+    pub categories: Vec<NamedId>,
+    /// 读取成员或历史失败时的说明
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchQueue {
+    pub items: Vec<DispatchItem>,
+    pub projects: Vec<DispatchProject>,
+    pub me_id: Option<u64>,
+    /// 视为“待分派”的状态名
+    pub pending_statuses: Vec<String>,
+}
+
+/// 派单请求
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DispatchRequest {
+    pub issue_id: u64,
+    /// single：指派给一个人；split：拆成子任务分别指派；assist：一人负责，其他人协作（加为关注人）
+    pub mode: String,
+    /// single / assist 的负责人
+    pub assignee_id: Option<u64>,
+    /// assist 的协作人
+    pub collaborator_ids: Vec<u64>,
+    /// split 的子任务
+    pub parts: Vec<SplitPart>,
+    /// split 时前端子任务等后端子任务完成（建立“阻挡”关联）
+    pub frontend_waits: bool,
+    /// 派单说明，被指派人会收到通知
+    pub notes: Option<String>,
+    /// 设置截止日期
+    pub due_date: Option<String>,
+    /// 没有指定截止日期、任务也没有截止日期时，按优先级设默认截止日期
+    pub auto_due: bool,
+    /// 把我加为关注人；留空按设置
+    pub watch: Option<bool>,
+    /// 派单后切换到的状态；留空按设置
+    pub status_id: Option<u64>,
+    /// 同时修改 Redmine 类别
+    pub category_id: Option<u64>,
+    /// 推荐的负责人，用于统计推荐命中率
+    pub suggested_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchOutcome {
+    pub issue_id: u64,
+    pub ok: bool,
+    pub mode: String,
+    /// 被指派的人
+    pub assigned_to: Vec<String>,
+    /// split 时创建的子任务
+    pub created: Vec<ChildIssue>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// 设置里“团队分工”的一行：成员及按历史推断的分工
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamCandidate {
+    pub id: u64,
+    pub name: String,
+    pub projects: Vec<String>,
+    pub load: usize,
+    pub guessed_role: String,
+    /// 推断依据，例如“近期 12 个任务中 9 个涉及页面”
+    pub guess_reason: String,
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 //!
 //! 写操作（回派、追问、备注、改状态、建关联）默认关闭，需在设置中打开“允许外部 AI 写操作”。
 
-use crate::models::{AssignItem, IssueFilter, IssueView, ResolveRequest, SplitPart};
+use crate::models::{AssignItem, DispatchQueue, DispatchRequest, IssueFilter, IssueView, ResolveRequest, SplitPart};
 use crate::service::Service;
 use anyhow::Result;
 use axum::extract::State;
@@ -60,6 +60,59 @@ fn brief(v: &IssueView, base_url: &str) -> Value {
         "missingInfo": a.missing_info,
         "url": format!("{base_url}/issues/{}", v.id),
     })
+}
+
+/// 分派台的精简结果：任务、推荐（单人或多人分工）、各项目可选成员
+fn dispatch_brief(q: &DispatchQueue, base_url: &str) -> Value {
+    let items: Vec<Value> = q
+        .items
+        .iter()
+        .map(|i| {
+            let v = &i.issue;
+            json!({
+                "id": v.id,
+                "subject": v.subject,
+                "projectId": v.project_id,
+                "project": v.project_name,
+                "author": v.author_name,
+                "priority": v.priority_name,
+                "assignedTo": v.assigned_to_name,
+                "createdOn": v.created_on,
+                "dueDate": v.due_date,
+                "defaultDue": i.default_due,
+                "summary": v.analysis.summary,
+                "missingInfo": v.analysis.missing_info,
+                "itemCount": i.item_count,
+                "suggestion": i.suggestion.as_ref().map(|s| json!({
+                    "assigneeId": s.assignee_id, "assigneeName": s.assignee_name, "reason": s.reason, "source": s.source,
+                })),
+                "multi": i.multi.as_ref().map(|m| json!({
+                    "reason": m.reason,
+                    "source": m.source,
+                    "parts": m.parts.iter().map(|p| json!({
+                        "role": p.role, "assigneeId": p.assignee_id, "assigneeName": p.assignee_name,
+                        "subject": p.subject, "description": p.description, "reason": p.reason,
+                    })).collect::<Vec<_>>(),
+                })),
+                "url": format!("{base_url}/issues/{}", v.id),
+            })
+        })
+        .collect();
+    let projects: Vec<Value> = q
+        .projects
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "error": p.error,
+                "members": p.members.iter().map(|m| json!({
+                    "id": m.id, "name": m.name, "isGroup": m.is_group, "role": m.role, "roleGuessed": m.role_guessed, "load": m.load, "key": m.key,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({ "pendingStatuses": q.pending_statuses, "items": items, "projects": projects })
 }
 
 // ---------------- 参数 ----------------
@@ -224,6 +277,56 @@ pub struct BulkAssignParams {
 pub struct BulkAssignItem {
     pub issue_id: u64,
     pub assignee_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[serde(default)]
+pub struct DispatchQueueParams {
+    /// 先让 RedPilot 配置的 AI 结合成员分工、正在负责的任务和负载给出建议（默认 false：用本地算法）
+    pub use_ai: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DispatchParams {
+    pub issue_id: u64,
+    /// single（默认）：指派给 assignee_id；split：按 parts 拆成子任务分别指派，原任务留在我名下跟踪；
+    /// assist：assignee_id 负责，collaborator_ids 协作（加为关注人，并在备注中说明）
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// single / assist 的负责人
+    #[serde(default)]
+    pub assignee_id: Option<u64>,
+    /// assist 的协作人
+    #[serde(default)]
+    pub collaborator_ids: Vec<u64>,
+    /// split 的子任务，可直接用 get_dispatch_queue 返回的 multi.parts
+    #[serde(default)]
+    pub parts: Vec<DispatchPartParam>,
+    /// split 时前端子任务等后端子任务完成（后端子任务“阻挡”前端子任务）
+    #[serde(default)]
+    pub frontend_waits: bool,
+    /// 派单说明，被指派人会收到通知
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// 截止日期 YYYY-MM-DD
+    #[serde(default)]
+    pub due_date: Option<String>,
+    /// 没给 due_date 且任务没有截止日期时，按优先级设默认截止日期（用户在设置中配置），默认 true
+    #[serde(default = "default_true")]
+    pub auto_due: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DispatchPartParam {
+    pub subject: String,
+    #[serde(default)]
+    pub description: String,
+    /// 也接受 get_dispatch_queue 返回的 assigneeId
+    #[serde(default, alias = "assigneeId")]
+    pub assignee_id: Option<u64>,
+    /// 分工方向，如 前端、后端（frontend_waits 依据它建立先后关系）
+    #[serde(default)]
+    pub role: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -532,6 +635,40 @@ impl RedPilotMcp {
         to_json(&self.svc.bulk_assign(&items, p.notes).await)
     }
 
+    #[tool(description = "分派台（开发经理视角）：等待我分派的任务（指派给我且处于“新建”一类状态的，以及我管理的项目里未指派的），每个任务给出推荐的负责人和理由；需要多人分工（如前端+后端）时给出 multi 方案。同时返回各项目可选成员的分工方向和负载。只给建议，不修改 Redmine。")]
+    async fn get_dispatch_queue(&self, Parameters(p): Parameters<DispatchQueueParams>) -> ToolResult {
+        self.prepare();
+        let mut q = self.svc.dispatch_queue().await.map_err(err)?;
+        if p.use_ai && !q.items.is_empty() {
+            let ids: Vec<u64> = q.items.iter().map(|i| i.issue.id).collect();
+            self.svc.ai_dispatch(&ids).await.map_err(err)?;
+            q = self.svc.dispatch_queue().await.map_err(err)?;
+        }
+        to_json(&dispatch_brief(&q, &self.base_url()))
+    }
+
+    #[tool(description = "【写操作】派单：把任务指派给一个人（single），或拆成子任务分给多人（split），或一人负责、其他人协作（assist）。默认把我加为关注人，任务没有截止日期时按优先级设默认截止日期。建议先用 get_dispatch_queue 生成方案并让用户确认。")]
+    async fn dispatch_issue(&self, Parameters(p): Parameters<DispatchParams>) -> ToolResult {
+        self.ensure_write()?;
+        let req = DispatchRequest {
+            issue_id: p.issue_id,
+            mode: p.mode.unwrap_or_else(|| if p.parts.is_empty() { "single".into() } else { "split".into() }),
+            assignee_id: p.assignee_id,
+            collaborator_ids: p.collaborator_ids,
+            parts: p
+                .parts
+                .into_iter()
+                .map(|x| SplitPart { subject: x.subject, description: x.description, assignee_id: x.assignee_id, role: x.role, ..Default::default() })
+                .collect(),
+            frontend_waits: p.frontend_waits,
+            notes: p.notes,
+            due_date: p.due_date,
+            auto_due: p.auto_due,
+            ..Default::default()
+        };
+        to_json(&self.svc.dispatch(&req).await.map_err(err)?)
+    }
+
     #[tool(description = "为一个任务给出拆分方案：问题里的不同部分（如前端、后端、测试）分给不同的人。返回每个子任务的标题、内容、建议负责人和理由，以及项目成员、类别和成员负载，便于你自行调整。默认按描述中分条列出的事项和历史分工推荐，use_ai=true 时由 AI 拆分。只给建议，不修改 Redmine。")]
     async fn suggest_split(&self, Parameters(p): Parameters<SuggestSplitParams>) -> ToolResult {
         self.prepare();
@@ -666,6 +803,7 @@ impl ServerHandler for RedPilotMcp {
                 "RedPilot 是用户的 Redmine 工单助手。典型流程：get_overview → sync_issues → list_issues / suggest_batches → \
                  get_issue 查看详情 → draft_resolution_note 起草说明 → 用户确认后 resolve_issue 回派给提出人。\
                  一个问题需要多人分工（如前端、后端）时：suggest_split 生成方案 → 用户确认后 split_issue 创建子任务。\
+                 开发经理分派问题：get_dispatch_queue 查看待分派任务和推荐 → 用户确认后 dispatch_issue 派单。\
                  写操作会直接修改 Redmine 并通知相关人员，执行前务必让用户确认内容。",
             )
     }

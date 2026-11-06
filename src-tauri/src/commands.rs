@@ -274,6 +274,57 @@ pub async fn split_issue(state: State<'_, AppState>, issue_id: u64, parts: Vec<S
 }
 
 #[tauri::command]
+pub async fn dispatch_queue(state: State<'_, AppState>) -> CmdResult<DispatchQueue> {
+    state.svc.dispatch_queue().await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn dispatch_preview(state: State<'_, AppState>, issue_id: u64) -> CmdResult<DispatchQueue> {
+    state.svc.dispatch_preview(issue_id).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn dispatch_issue(state: State<'_, AppState>, req: DispatchRequest) -> CmdResult<DispatchOutcome> {
+    state.svc.dispatch(&req).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn dispatch_batch(state: State<'_, AppState>, reqs: Vec<DispatchRequest>) -> CmdResult<Vec<DispatchOutcome>> {
+    Ok(state.svc.dispatch_batch(&reqs).await)
+}
+
+#[tauri::command]
+pub fn dispatch_keep(state: State<'_, AppState>, issue_id: u64) -> CmdResult<()> {
+    state.svc.dispatch_keep(issue_id).map_err(e)
+}
+
+#[tauri::command]
+pub fn dispatch_unmark(state: State<'_, AppState>, issue_id: u64) -> CmdResult<()> {
+    state.svc.dispatch_unmark(issue_id).map_err(e)
+}
+
+#[tauri::command]
+pub async fn mark_duplicate(
+    state: State<'_, AppState>,
+    issue_id: u64,
+    original_id: u64,
+    notes: Option<String>,
+    status_id: Option<u64>,
+) -> CmdResult<ResolveOutcome> {
+    state.svc.mark_duplicate(issue_id, original_id, notes, status_id).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn ai_dispatch(state: State<'_, AppState>, issue_ids: Vec<u64>) -> CmdResult<usize> {
+    state.svc.ai_dispatch(&issue_ids).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn dispatch_team(state: State<'_, AppState>) -> CmdResult<Vec<TeamCandidate>> {
+    state.svc.dispatch_team().await.map_err(e)
+}
+
+#[tauri::command]
 pub fn recent_changes(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec<IssueChange>> {
     state.svc.recent_changes(limit).map_err(e)
 }

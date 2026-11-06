@@ -3,6 +3,7 @@ import { CommandPalette } from "./components/CommandPalette";
 import { AppProvider, useApp } from "./lib/store";
 import { ToastProvider } from "./lib/toast";
 import { DashboardPage } from "./pages/Dashboard";
+import { DispatchPage } from "./pages/Dispatch";
 import { InboxPage } from "./pages/Inbox";
 import { PlanPage } from "./pages/Plan";
 import { ProjectPage } from "./pages/Project";
@@ -15,6 +16,7 @@ function Shell() {
       <Sidebar />
       <main className="min-w-0 flex-1 bg-canvas">
         {page === "inbox" && <InboxPage />}
+        {page === "dispatch" && <DispatchPage />}
         {page === "project" && <ProjectPage />}
         {page === "plan" && <PlanPage />}
         {page === "dashboard" && <DashboardPage />}

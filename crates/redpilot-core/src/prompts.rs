@@ -92,6 +92,20 @@ pub fn split_system() -> String {
         .to_string()
 }
 
+pub fn dispatch_system() -> String {
+    r#"你是开发经理的派单助手。项目上的人提交的问题都先到开发经理这里，需要分派给合适的开发成员。
+对每个待分派任务，判断由一个人处理还是需要多人分工，并给出人选。只输出 JSON，格式：
+{"items":[{"issueId":任务ID(数字),"assigneeId":成员ID(数字),"reason":"30 字以内的理由","parts":[{"role":"前端","assigneeId":成员ID(数字),"subject":"子任务标题","description":"这部分要做什么","reason":"30 字以内"}]}]}
+要求：
+- 每个待分派任务都要给出结果，assigneeId 必须来自成员列表；
+- 大多数任务一个人就能处理，此时省略 parts；只有确实需要不同方向的人分别动手（例如前端改界面、后端改接口）时才给 parts，2-4 个，每个 part 的人不同，assigneeId 填主要负责的人；
+- parts 的 subject 写成“原标题（方向）”的形式，description 写清这一部分具体做什么；
+- 成员的“分工”说明了他做哪个方向，优先按分工派；其次看他正在负责的任务是否同一模块；类别设置了默认负责人时优先考虑；
+- 能力相当时分给负载更低的人，避免集中到同一个人；
+- 本地算法的推荐只是参考，可以推翻，但要在理由中说明依据。"#
+        .to_string()
+}
+
 pub fn report_system(days: i64) -> String {
     format!(
         r#"你是工程师的周报助手。根据最近 {days} 天的工单处置记录，写一份工作报告（Markdown）：

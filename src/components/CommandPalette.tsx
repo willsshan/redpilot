@@ -7,6 +7,7 @@ import {
   ExternalLink,
   FileText,
   FolderKanban,
+  Forward,
   Inbox,
   Kanban,
   LayoutList,
@@ -17,6 +18,7 @@ import {
   Settings,
   Sparkles,
   Tags,
+  Users,
   Workflow,
 } from "lucide-react";
 import { api, errorText, type IssueView } from "../lib/api";
@@ -126,6 +128,7 @@ export function CommandPalette() {
       { id: "board", group: "命令", title: "切换到看板视图", keywords: "board kanban", icon: <Kanban className="size-4" />, run: () => go("inbox", { type: "inboxView", view: "board" }) },
       { id: "list", group: "命令", title: "切换到列表视图", keywords: "list liebiao", icon: <LayoutList className="size-4" />, run: () => go("inbox", { type: "inboxView", view: "list" }) },
       { id: "inbox", group: "页面", title: "收件箱", keywords: "inbox shoujianxiang", icon: <Inbox className="size-4" />, run: () => go("inbox") },
+      { id: "dispatch", group: "页面", title: "分派台", subtitle: "把收到的问题派给团队成员", keywords: "dispatch assign fenpai paidan zhuanpai", icon: <Forward className="size-4" />, run: () => go("dispatch") },
       { id: "project", group: "页面", title: "项目总览", subtitle: "项目进度、成员负载、批量转派", keywords: "project overview manager zhuanpai xiangmu", icon: <FolderKanban className="size-4" />, run: () => go("project") },
       { id: "plan-page", group: "页面", title: "AI 规划", keywords: "plan guihua", icon: <Sparkles className="size-4" />, run: () => go("plan") },
       { id: "dashboard", group: "页面", title: "统计与报告", keywords: "dashboard stats tongji", icon: <BarChart3 className="size-4" />, run: () => go("dashboard") },
@@ -135,6 +138,7 @@ export function CommandPalette() {
       section("workflow", "工作流", <Workflow className="size-4" />, "workflow status zhuangtai"),
       section("ai", "AI 模型", <Bot className="size-4" />, "ai deepseek model prompt"),
       section("mcp", "MCP 服务", <Plug className="size-4" />, "mcp token"),
+      section("dispatch", "分派", <Users className="size-4" />, "dispatch team fenpai fengong tuandui"),
       section("rules", "分类规则", <Tags className="size-4" />, "rules category fenlei"),
     ];
     if (config?.redmine.baseUrl) {

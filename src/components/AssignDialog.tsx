@@ -11,9 +11,10 @@ export const SOURCE_LABEL: Record<AssignSuggestion["source"], string> = {
   category: "类别负责人",
   history: "相似任务",
   workload: "负载最低",
+  role: "分工",
 };
 
-export const sourceTone = (s: AssignSuggestion["source"]): "accent" | "ok" | "info" => (s === "ai" ? "accent" : s === "category" ? "ok" : "info");
+export const sourceTone = (s: AssignSuggestion["source"]): "accent" | "ok" | "info" => (s === "ai" ? "accent" : s === "category" || s === "role" ? "ok" : "info");
 
 /** 成员下拉选项：用户（带当前未关闭数）和组 */
 export function MemberOptions({ members, load }: { members: Assignee[]; load: Map<number, number> }) {

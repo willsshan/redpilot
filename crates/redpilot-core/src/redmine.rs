@@ -59,6 +59,8 @@ pub struct IssueUpdate {
     pub status_id: Option<u64>,
     pub assigned_to_id: Option<u64>,
     pub done_ratio: Option<u32>,
+    pub due_date: Option<String>,
+    pub category_id: Option<u64>,
     pub uploads: Vec<UploadRef>,
 }
 
@@ -303,6 +305,12 @@ impl RedmineClient {
         if let Some(d) = u.done_ratio {
             issue.insert("done_ratio".into(), json!(d));
         }
+        if let Some(d) = &u.due_date {
+            issue.insert("due_date".into(), json!(d));
+        }
+        if let Some(c) = u.category_id {
+            issue.insert("category_id".into(), json!(c));
+        }
         if !u.uploads.is_empty() {
             let ups: Vec<Value> = u
                 .uploads
@@ -437,6 +445,13 @@ impl RedmineClient {
             Some(json!({ "relation": { "issue_to_id": issue_to_id, "relation_type": relation_type } })),
         )
         .await?;
+        Ok(())
+    }
+
+    /// 添加关注人（需要“添加关注者”权限）
+    pub async fn add_watcher(&self, issue_id: u64, user_id: u64) -> Result<()> {
+        self.request(Method::POST, &format!("/issues/{issue_id}/watchers.json"), &[], Some(json!({ "user_id": user_id })))
+            .await?;
         Ok(())
     }
 

@@ -12,8 +12,24 @@ let seq = 1;
 const blank = (): Row => ({ key: seq++, subject: "", description: "" });
 const toRows = (parts: SplitPart[]): Row[] => parts.map((p) => ({ ...p, key: seq++, suggestedId: p.assigneeId ?? null }));
 
-/** 拆分任务：同一个问题的不同部分（前端、后端、测试……）建成子任务，分别指派 */
-export function SplitDialog({ issueId, onClose, onDone }: { issueId: number | null; onClose: () => void; onDone: () => void }) {
+/**
+ * 拆分任务：同一个问题的不同部分（前端、后端、测试……）建成子任务，分别指派。
+ * 传入 `onSubmitParts` 时（分派台），确认后只把方案交回去，由派单栏一起提交。
+ */
+export function SplitDialog({
+  issueId,
+  onClose,
+  onDone,
+  initialParts,
+  onSubmitParts,
+}: {
+  issueId: number | null;
+  onClose: () => void;
+  onDone: () => void;
+  /** 打开时使用的方案（不再自动按条目拆分） */
+  initialParts?: SplitPart[];
+  onSubmitParts?: (parts: SplitPart[]) => void;
+}) {
   const toast = useToast();
   const [ctx, setCtx] = useState<SplitSuggestion | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
@@ -45,7 +61,14 @@ export function SplitDialog({ issueId, onClose, onDone }: { issueId: number | nu
     setRows([]);
     setHint(null);
     setAddNote(true);
-    void suggest(false, true);
+    if (initialParts?.length && issueId !== null) {
+      // 仍然读取成员和类别，但保留传入的方案
+      setRows(toRows(initialParts));
+      api
+        .suggestSplit(issueId, false)
+        .then((s) => setCtx(s))
+        .catch(() => {});
+    } else void suggest(false, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueId]);
 
@@ -66,7 +89,13 @@ export function SplitDialog({ issueId, onClose, onDone }: { issueId: number | nu
       assigneeId: r.assigneeId ?? null,
       categoryId: r.categoryId ?? null,
       estimatedHours: r.estimatedHours ?? null,
+      role: r.role ?? "",
     }));
+    if (onSubmitParts) {
+      onSubmitParts(parts);
+      onClose();
+      return;
+    }
     const id = issueId;
     onClose();
     toast.withUndo(`正在把 #${id} 拆分为 ${parts.length} 个子任务`, async () => {
@@ -110,18 +139,23 @@ export function SplitDialog({ issueId, onClose, onDone }: { issueId: number | nu
       subtitle="把问题的不同部分建成子任务，分别指派给不同的人；子任务沿用原任务的项目、跟踪、优先级、版本和截止日期"
       footer={
         <>
-          <label className="mr-auto flex items-center gap-2 text-[12.5px] text-ink-2">
-            <Switch checked={addNote} onChange={setAddNote} />
-            在原任务添加拆分说明（列出子任务和负责人）
-          </label>
+          {onSubmitParts ? (
+            <span className="mr-auto text-[12.5px] text-ink-2">确认后回到派单栏，和截止日期、备注一起派出</span>
+          ) : (
+            <label className="mr-auto flex items-center gap-2 text-[12.5px] text-ink-2">
+              <Switch checked={addNote} onChange={setAddNote} />
+              在原任务添加拆分说明（列出子任务和负责人）
+            </label>
+          )}
           <span className="text-[12px] text-ink-3">
-            {valid.length > 0 ? `分给 ${people.slice(0, 3).join("、")}${people.length > 3 ? ` 等 ${people.length} 人` : ""} · ` : ""}提交后 5 秒内可撤销
+            {valid.length > 0 ? `分给 ${people.slice(0, 3).join("、")}${people.length > 3 ? ` 等 ${people.length} 人` : ""}` : ""}
+            {onSubmitParts ? "" : `${valid.length > 0 ? " · " : ""}提交后 5 秒内可撤销`}
           </span>
           <Button variant="ghost" onClick={onClose}>
             取消
           </Button>
           <Button variant="primary" icon={<GitFork className="size-4" />} disabled={valid.length === 0 || busy !== null} onClick={submit}>
-            创建 {valid.length} 个子任务 <span className="opacity-70">{modKey}↵</span>
+            {onSubmitParts ? `使用这 ${valid.length} 个子任务` : `创建 ${valid.length} 个子任务`} <span className="opacity-70">{modKey}↵</span>
           </Button>
         </>
       }

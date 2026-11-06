@@ -103,10 +103,44 @@ CREATE TABLE IF NOT EXISTS issue_changes (
     detected_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_changes_detected ON issue_changes(detected_at);
+
+-- 分派台：留给自己处理、已拆分等不再出现在分派台的任务（任务离开收件箱后清除）
+CREATE TABLE IF NOT EXISTS dispatch_marks (
+    issue_id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 派单记录：派给了谁、是否采用了推荐，用于后续跟踪和统计
+CREATE TABLE IF NOT EXISTS dispatches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    assignee_ids TEXT NOT NULL,
+    assignee_names TEXT NOT NULL,
+    child_ids TEXT NOT NULL DEFAULT '',
+    due_date TEXT,
+    suggested_id INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispatches_created ON dispatches(created_at);
+
+-- AI 给出的派单建议，任务更新后失效
+CREATE TABLE IF NOT EXISTS dispatch_ai (
+    issue_id INTEGER PRIMARY KEY,
+    issue_updated_on TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 "#;
 
 /// 旧版本数据库缺少的列
-const MIGRATIONS: [(&str, &str, &str); 1] = [("issues", "change_hint", "TEXT")];
+const MIGRATIONS: [(&str, &str, &str); 3] = [
+    ("issues", "change_hint", "TEXT"),
+    ("issues", "category_id", "INTEGER"),
+    ("issues", "category_name", "TEXT"),
+];
 
 /// 同步前任务在本地的状态，用于判断别人改了什么
 #[derive(Debug, Clone)]
@@ -132,7 +166,7 @@ const VIEW_COLUMNS: &str = "i.id, i.project_id, i.project_name, i.tracker_name, 
     i.read_updated_on,
     a.rule_category, a.ai_category, a.ai_module, a.urgency, a.difficulty, a.est_hours, a.summary,
     a.missing_info, a.follow_up, a.suggestion, a.ai_issue_updated_on, a.manual_category, a.manual_module,
-    i.change_hint";
+    i.change_hint, i.category_id, i.category_name";
 
 /// 优先级名称里带这些字的视为高优先级
 pub const HIGH_PRIORITY_WORDS: [&str; 6] = ["高", "紧急", "立刻", "urgent", "high", "immediate"];
@@ -210,8 +244,8 @@ impl Db {
                 "INSERT INTO issues (id, project_id, project_name, tracker_name, status_id, status_name,
                     priority_id, priority_name, author_id, author_name, assigned_to_id, assigned_to_name,
                     subject, description, done_ratio, due_date, created_on, updated_on, in_inbox,
-                    first_seen_at, synced_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,1,?19,?19)
+                    first_seen_at, synced_at, category_id, category_name)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,1,?19,?19,?20,?21)
                  ON CONFLICT(id) DO UPDATE SET
                     project_id=excluded.project_id, project_name=excluded.project_name,
                     tracker_name=excluded.tracker_name, status_id=excluded.status_id,
@@ -221,7 +255,8 @@ impl Db {
                     assigned_to_name=excluded.assigned_to_name, subject=excluded.subject,
                     description=excluded.description, done_ratio=excluded.done_ratio,
                     due_date=excluded.due_date, created_on=excluded.created_on,
-                    updated_on=excluded.updated_on, in_inbox=1, synced_at=excluded.synced_at",
+                    updated_on=excluded.updated_on, in_inbox=1, synced_at=excluded.synced_at,
+                    category_id=excluded.category_id, category_name=excluded.category_name",
                 params![
                     is.id,
                     is.project.id,
@@ -242,6 +277,8 @@ impl Db {
                     is.created_on,
                     is.updated_on,
                     now,
+                    is.category.as_ref().map(|c| c.id),
+                    is.category.as_ref().map(|c| c.name.clone()),
                 ],
             )?;
         }
@@ -269,7 +306,8 @@ impl Db {
         let Some(old) = old else { return Ok(()) };
         tx.execute(
             "UPDATE issues SET status_id = ?2, status_name = ?3, assigned_to_id = ?4, assigned_to_name = ?5,
-                done_ratio = ?6, updated_on = ?7, read_updated_on = ?7, detail_json = ?8, detail_updated_on = ?7
+                done_ratio = ?6, updated_on = ?7, read_updated_on = ?7, detail_json = ?8, detail_updated_on = ?7,
+                due_date = ?9, category_id = ?10, category_name = ?11
              WHERE id = ?1",
             params![
                 is.id,
@@ -280,6 +318,9 @@ impl Db {
                 is.done_ratio.unwrap_or(0),
                 is.updated_on,
                 serde_json::to_string(is)?,
+                is.due_date,
+                is.category.as_ref().map(|c| c.id),
+                is.category.as_ref().map(|c| c.name.clone()),
             ],
         )?;
         tx.execute(
@@ -582,6 +623,96 @@ impl Db {
         }
         Ok(out)
     }
+
+    // ---------------- 分派台 ----------------
+
+    pub fn set_dispatch_mark(&self, id: u64, kind: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO dispatch_marks(issue_id, kind, created_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(issue_id) DO UPDATE SET kind = excluded.kind, created_at = excluded.created_at",
+            params![id, kind, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_dispatch_mark(&self, id: u64) -> Result<()> {
+        self.lock().execute("DELETE FROM dispatch_marks WHERE issue_id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// 不再出现在分派台的任务。已离开收件箱的任务清掉标记，再次回到我这里时重新进入分派台。
+    pub fn dispatch_marks(&self) -> Result<std::collections::HashMap<u64, String>> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM dispatch_marks WHERE issue_id IN (SELECT id FROM issues WHERE in_inbox = 0)",
+            [],
+        )?;
+        let mut stmt = conn.prepare("SELECT issue_id, kind FROM dispatch_marks")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_dispatch(
+        &self,
+        issue_id: u64,
+        subject: &str,
+        mode: &str,
+        assignees: &[(u64, String)],
+        child_ids: &[u64],
+        due_date: Option<&str>,
+        suggested_id: Option<u64>,
+    ) -> Result<()> {
+        let ids: Vec<String> = assignees.iter().map(|a| a.0.to_string()).collect();
+        let names: Vec<&str> = assignees.iter().map(|a| a.1.as_str()).collect();
+        let children: Vec<String> = child_ids.iter().map(u64::to_string).collect();
+        self.lock().execute(
+            "INSERT INTO dispatches(issue_id, subject, mode, assignee_ids, assignee_names, child_ids, due_date, suggested_id, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![issue_id, subject, mode, ids.join(","), names.join("、"), children.join(","), due_date, suggested_id, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 最近派单次数：成员 ID → 次数
+    pub fn dispatch_counts(&self, days: i64) -> Result<std::collections::HashMap<u64, usize>> {
+        let since = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT assignee_ids FROM dispatches WHERE created_at >= ?1")?;
+        let rows = stmt.query_map([since], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashMap::new();
+        for ids in rows {
+            for id in ids?.split(',').filter_map(|x| x.parse::<u64>().ok()) {
+                *out.entry(id).or_default() += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn save_dispatch_ai(&self, id: u64, issue_updated_on: &str, json: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO dispatch_ai(issue_id, issue_updated_on, result_json, created_at) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(issue_id) DO UPDATE SET issue_updated_on = excluded.issue_updated_on,
+                result_json = excluded.result_json, created_at = excluded.created_at",
+            params![id, issue_updated_on, json, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// AI 派单建议：任务 ID → (生成时任务的 updated_on, JSON)
+    pub fn dispatch_ai(&self, ids: &[u64]) -> Result<std::collections::HashMap<u64, (String, String)>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let list: Vec<String> = ids.iter().map(u64::to_string).collect();
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT issue_id, issue_updated_on, result_json FROM dispatch_ai WHERE issue_id IN ({})",
+            list.join(",")
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, (r.get::<_, String>(1)?, r.get::<_, String>(2)?))))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
 }
 
 fn row_to_view(r: &Row) -> rusqlite::Result<IssueView> {
@@ -633,6 +764,8 @@ fn row_to_view(r: &Row) -> rusqlite::Result<IssueView> {
         unread: read_updated_on.as_deref() != Some(updated_on.as_str()),
         overdue,
         change_hint: r.get(33)?,
+        redmine_category_id: r.get(34)?,
+        redmine_category: r.get(35)?,
         analysis: Analysis {
             category,
             category_source: source.map(str::to_string),

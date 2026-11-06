@@ -6,12 +6,12 @@
 
 **Redmine 智能工单助手**
 
-自动拉取任务 · AI 分类与合并规划 · 一键回派提出人 · 原生 MCP 服务
+自动拉取任务 · AI 分类与合并规划 · 一键回派提出人 · 键盘派单 · 原生 MCP 服务
 
 ![Rust](https://img.shields.io/badge/Rust-Tauri%202-orange?logo=rust)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
-![MCP](https://img.shields.io/badge/MCP-27%20tools-8e4ec6)
+![MCP](https://img.shields.io/badge/MCP-29%20tools-8e4ec6)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -19,6 +19,8 @@
 ---
 
 RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台拉取指派给你的任务，用 DeepSeek 做分类和分析，找出可以合并处理的任务。处理完后，写几句要点，点一下就能生成规范的处置说明，并把任务回派给提出人。
+
+如果你是开发经理，项目上的问题都先到你这里，可以在**分派台**里按推荐一键派给团队成员；前端、后端都要改的问题，一次分给两个人。
 
 它还内置了 MCP 服务，Claude、Cursor、Cherry Studio 等 AI 助手可以直接查询、分析和处理你的工单。
 
@@ -42,6 +44,20 @@ RedPilot 是给 Redmine 问题处理人用的桌面效率工具。它在后台�
 - 描述和沟通记录中的**图片直接显示**（附件需要登录才能访问，由 RedPilot 带 API Key 下载并缓存），点击可放大
 - 拖动卡片即可修改 Redmine 状态，拖到底部回派区直接回派
 - **⌘K / Ctrl+K 命令面板**：搜索任务、跳转页面、执行同步、分析、规划、日报和周报
+
+### 📮 分派台（开发经理）
+- 汇总等你分派的问题：指派给你、还处于“新建”一类状态的，以及你管理的项目里没人负责的
+- 每个问题都给出推荐人选和理由：类别默认负责人、谁处理过类似问题、成员的分工方向、当前负载；也可以让 AI 结合这些信息推荐
+- **键盘派单**：<kbd>↵</kbd> 按推荐派出，数字键直接派给对应成员，<kbd>A</kbd> 搜索其他人；派完自动跳到下一个，5 秒内可撤销
+- **前后端一起派**：问题同时涉及页面和接口时，推荐拆给前端和后端两个人；也可以 <kbd>⇧</kbd>+数字自己选人。可以拆成子任务每人一个（可设“前端等后端完成”），也可以一人负责、其他人协作（加为关注人）
+- 派单时顺手设置截止日期（没填的按优先级给默认期限，跳过周末）、写一句备注，并把你加为关注人，后续进度都能收到
+- 其他操作：<kbd>Q</kbd> 追问提出人、<kbd>S</kbd> 编辑拆分方案、<kbd>D</kbd> 标为重复、<kbd>E</kbd> 留给自己处理；<kbd>X</kbd> 多选后可以一起派给某人，或 <kbd>⇧↵</kbd> 全部按推荐派出
+- **团队分工**：在设置里给成员标上前端、后端、测试等方向，前 9 位对应数字键；没标的按历史任务自动推断
+- 收件箱里按 <kbd>T</kbd>，或在收件箱、项目总览的任务详情里点“转派”，也能用同样的方式派出去
+
+<p align="center">
+  <img src="docs/screenshots/dispatch.png" width="760" alt="分派台" />
+</p>
 
 ### 🧭 项目总览（项目管理员视角）
 - 选择项目查看全部未关闭任务（不限于指派给自己的），自己担任管理角色的项目排在前面
@@ -176,8 +192,8 @@ claude mcp add --transport http redpilot http://127.0.0.1:39217/mcp \
 | 类型 | 工具 |
 |---|---|
 | 查询与分析 | `get_overview` · `sync_issues` · `list_issues` · `get_recent_changes` · `get_issue` · `analyze_issues` · `suggest_batches` · `get_latest_plan` · `find_similar_issues` · `get_workflow_options` · `list_assignees` · `draft_resolution_note` · `set_classification` · `work_report` |
-| 项目总览 | `list_my_projects` · `get_project_overview` · `suggest_assignments` · `suggest_split` |
-| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `bulk_assign` · `split_issue` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
+| 项目与分派 | `list_my_projects` · `get_project_overview` · `get_dispatch_queue` · `suggest_assignments` · `suggest_split` |
+| 写操作（需授权） | `resolve_issue`（可带附件） · `batch_resolve` · `dispatch_issue` · `bulk_assign` · `split_issue` · `request_more_info` · `start_progress` · `update_status` · `add_note` · `link_issues` |
 
 写操作会直接修改 Redmine 并通知相关人员，需要在设置中手动开启“允许外部 AI 执行写操作”。通过 MCP 上传附件时，隐藏目录和 RedPilot 数据目录中的文件会被拒绝。
 
@@ -276,6 +292,7 @@ redpilot/
 - [x] 看板视图、⌘K 命令面板、回派附件、动态与到期提醒、开机自启（v0.2）
 - [x] 项目总览：版本进度、成员负载、多选一键转派（v0.2）
 - [x] 拆分任务：按条目或 AI 拆成子任务分给不同的人
+- [x] 分派台：键盘派单、前后端一起派、团队分工与默认期限
 - [ ] 多服务器 / 多账号
 - [ ] 自动更新、安装包签名
 

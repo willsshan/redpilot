@@ -23,8 +23,8 @@ interface ToastItem {
 interface ToastApi {
   show: (t: Omit<ToastItem, "id" | "createdAt">, durationMs?: number) => number;
   dismiss: (id: number) => void;
-  /** 延迟执行写操作，期间可撤销 */
-  withUndo: (title: string, run: () => Promise<void>, delayMs?: number) => void;
+  /** 延迟执行写操作，期间可撤销；撤销时调用 onUndo */
+  withUndo: (title: string, run: () => Promise<void>, delayMs?: number, onUndo?: () => void) => void;
 }
 
 const Ctx = createContext<ToastApi | null>(null);
@@ -60,7 +60,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 
   const withUndo = useCallback(
-    (title: string, run: () => Promise<void>, delayMs = 5000) => {
+    (title: string, run: () => Promise<void>, delayMs = 5000, onUndo?: () => void) => {
       let cancelled = false;
       const id = show(
         {
@@ -73,6 +73,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             onClick: () => {
               cancelled = true;
               dismiss(id);
+              onUndo?.();
               show({ tone: "info", title: "已撤销，未做任何修改" });
             },
           },

@@ -10,6 +10,7 @@ import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
 import { Board, type GroupBy } from "../components/Board";
 import { SplitDialog } from "../components/SplitDialog";
+import { DispatchDialog } from "../components/DispatchDialog";
 
 type Quick = "all" | "unread" | "changed" | "overdue" | "missing";
 type View = "list" | "board";
@@ -98,6 +99,7 @@ export function InboxPage() {
   const [resolveFor, setResolveFor] = useState<IssueView[] | null>(null);
   const [followUp, setFollowUp] = useState(false);
   const [splitFor, setSplitFor] = useState<number | null>(null);
+  const [assignFor, setAssignFor] = useState<number | null>(null);
   const [analyzingAll, setAnalyzingAll] = useState(false);
   const [view, setViewState] = useState<View>(() => stored("rp.inbox.view", ["list", "board"] as const, "list"));
   const [groupBy, setGroupByState] = useState<GroupBy>(() => stored("rp.board.group", ["status", "category", "project", "urgency"] as const, "status"));
@@ -251,7 +253,7 @@ export function InboxPage() {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
-      if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || resolveFor || followUp || splitFor !== null) return;
+      if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || resolveFor || followUp || splitFor !== null || assignFor !== null) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (view === "board") {
         if (e.key === "Escape" && drawer) setDrawer(false);
@@ -261,6 +263,9 @@ export function InboxPage() {
         } else if (e.key === "s" && drawer && current) {
           e.preventDefault();
           setSplitFor(current.id);
+        } else if (e.key === "t" && drawer && current) {
+          e.preventDefault();
+          setAssignFor(current.id);
         } else if (e.key === "/") {
           e.preventDefault();
           searchRef.current?.focus();
@@ -289,6 +294,9 @@ export function InboxPage() {
       } else if (e.key === "s" && current) {
         e.preventDefault();
         setSplitFor(current.id);
+      } else if (e.key === "t" && current) {
+        e.preventDefault();
+        setAssignFor(current.id);
       }
     };
     window.addEventListener("keydown", h);
@@ -509,6 +517,7 @@ export function InboxPage() {
                   onResolve={() => setResolveFor([current])}
                   onFollowUp={() => setFollowUp(true)}
                   onSplit={() => setSplitFor(current.id)}
+                  onAssign={() => setAssignFor(current.id)}
                   onClose={() => setDrawer(false)}
                 />
               </div>
@@ -628,9 +637,10 @@ export function InboxPage() {
               onResolve={() => setResolveFor([current])}
               onFollowUp={() => setFollowUp(true)}
               onSplit={() => setSplitFor(current.id)}
+              onAssign={() => setAssignFor(current.id)}
             />
           ) : (
-            loaded && <Empty icon={<Check className="size-6" />} title="选择一个任务查看详情" desc={<>用 <Kbd>J</Kbd> <Kbd>K</Kbd> 上下切换，<Kbd>X</Kbd> 多选，<Kbd>R</Kbd> 回派，<Kbd>S</Kbd> 拆分</>} />
+            loaded && <Empty icon={<Check className="size-6" />} title="选择一个任务查看详情" desc={<>用 <Kbd>J</Kbd> <Kbd>K</Kbd> 上下切换，<Kbd>X</Kbd> 多选，<Kbd>R</Kbd> 回派，<Kbd>T</Kbd> 转派，<Kbd>S</Kbd> 拆分</>} />
           )}
         </div>
       </div>
@@ -644,6 +654,7 @@ export function InboxPage() {
       />
       <FollowUpDialog open={followUp} onClose={() => setFollowUp(false)} issue={current} />
       <SplitDialog issueId={splitFor} onClose={() => setSplitFor(null)} onDone={() => current && void loadDetail(current.id, true)} />
+      <DispatchDialog issueId={assignFor} onClose={() => setAssignFor(null)} onDone={() => current && void loadDetail(current.id, true)} />
     </div>
   );
 }

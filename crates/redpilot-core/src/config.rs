@@ -54,6 +54,7 @@ pub struct AppConfig {
     pub ai: AiConfig,
     pub mcp: McpConfig,
     pub rules: Vec<CategoryRule>,
+    pub dispatch: DispatchConfig,
 }
 
 impl Default for AppConfig {
@@ -65,6 +66,7 @@ impl Default for AppConfig {
             ai: AiConfig::default(),
             mcp: McpConfig::default(),
             rules: default_rules(),
+            dispatch: DispatchConfig::default(),
         }
     }
 }
@@ -119,6 +121,8 @@ pub struct SyncConfig {
     pub notify_due: bool,
     /// 新任务自动做 AI 分析
     pub auto_analyze: bool,
+    /// 同时拉取我管理的项目里未指派的任务（进入分派台）
+    pub managed_unassigned: bool,
 }
 
 impl Default for SyncConfig {
@@ -133,6 +137,7 @@ impl Default for SyncConfig {
             notify_changes: true,
             notify_due: true,
             auto_analyze: true,
+            managed_unassigned: true,
         }
     }
 }
@@ -171,6 +176,65 @@ impl Default for WorkflowConfig {
             ],
         }
     }
+}
+
+/// 分派台：开发经理把收到的问题派给团队成员
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DispatchConfig {
+    /// 指派给我、处于这些状态的任务进入分派台；留空时自动识别“新建”一类的状态
+    pub pending_status_ids: Vec<u64>,
+    /// 拉取未指派任务的项目；留空为我担任管理角色的项目
+    pub project_ids: Vec<u64>,
+    /// 派单时把我加为关注人，便于跟进
+    pub watch: bool,
+    /// 任务没有截止日期时，按优先级给的默认期限（工作日）
+    pub due_days: DueDays,
+    /// 派单后切换到的状态，留空不改
+    pub assigned_status_id: Option<u64>,
+    /// 派单备注模板，可用 {负责人} {提出人} {截止日期}
+    pub note_template: String,
+    /// 团队分工与常用成员，顺序就是分派台里数字键的顺序
+    pub team: Vec<TeamMember>,
+}
+
+impl Default for DispatchConfig {
+    fn default() -> Self {
+        Self {
+            pending_status_ids: vec![],
+            project_ids: vec![],
+            watch: true,
+            due_days: DueDays::default(),
+            assigned_status_id: None,
+            note_template: String::new(),
+            team: vec![],
+        }
+    }
+}
+
+/// 各优先级的默认期限（工作日），0 表示不设置
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DueDays {
+    pub urgent: u32,
+    pub high: u32,
+    pub normal: u32,
+    pub low: u32,
+}
+
+impl Default for DueDays {
+    fn default() -> Self {
+        Self { urgent: 1, high: 3, normal: 5, low: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TeamMember {
+    pub id: u64,
+    pub name: String,
+    /// 分工方向：前端、后端、全栈、测试、运维、数据、产品，留空表示未设置
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

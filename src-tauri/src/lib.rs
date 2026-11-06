@@ -111,6 +111,15 @@ pub fn run() {
             commands::bulk_assign,
             commands::suggest_split,
             commands::split_issue,
+            commands::dispatch_queue,
+            commands::dispatch_preview,
+            commands::dispatch_issue,
+            commands::dispatch_batch,
+            commands::dispatch_keep,
+            commands::dispatch_unmark,
+            commands::mark_duplicate,
+            commands::ai_dispatch,
+            commands::dispatch_team,
             commands::get_autostart,
             commands::set_autostart,
             commands::statuses,
@@ -200,7 +209,9 @@ fn update_tray(app: &AppHandle) {
     let stats = app.state::<AppState>().svc.stats().ok();
     let open = stats.as_ref().map(|s| s.open_total).unwrap_or(0);
     let unread = stats.as_ref().map(|s| s.unread).unwrap_or(0);
-    let _ = tray.set_tooltip(Some(format!("RedPilot · {open} 个待办，{unread} 个未读")));
+    let pending = stats.as_ref().map(|s| s.dispatch_pending).unwrap_or(0);
+    let extra = if pending > 0 { format!("，{pending} 个待分派") } else { String::new() };
+    let _ = tray.set_tooltip(Some(format!("RedPilot · {open} 个待办，{unread} 个未读{extra}")));
     #[cfg(target_os = "macos")]
     let _ = tray.set_title(if unread > 0 { Some(unread.to_string()) } else { None });
 }
@@ -216,12 +227,14 @@ fn notify_new(app: &AppHandle, svc: &Service, report: &SyncReport) {
         .filter_map(|id| svc.db.get_view(*id).ok().flatten())
         .map(|v| format!("#{} {}", v.id, v.subject))
         .collect();
-    let _ = app
-        .notification()
-        .builder()
-        .title(format!("收到 {} 个新任务", report.new_ids.len()))
-        .body(subjects.join("\n"))
-        .show();
+    let pending = svc.dispatch_pending_ids();
+    let to_dispatch = report.new_ids.iter().filter(|id| pending.contains(id)).count();
+    let title = if to_dispatch > 0 {
+        format!("收到 {} 个新任务，{to_dispatch} 个待分派", report.new_ids.len())
+    } else {
+        format!("收到 {} 个新任务", report.new_ids.len())
+    };
+    let _ = app.notification().builder().title(title).body(subjects.join("\n")).show();
 }
 
 /// 提出人回复、任务被转回、调为高优先级时通知

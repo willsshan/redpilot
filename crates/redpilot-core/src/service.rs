@@ -2,7 +2,7 @@
 
 use crate::ai::{AiClient, Message, Usage};
 use crate::analysis::{self, Corpus};
-use crate::config::{self, AppConfig, Paths, TextFormat};
+use crate::config::{self, AppConfig, Paths, TeamMember, TextFormat};
 use crate::db::{self, Db, PrevIssue};
 use crate::models::*;
 use crate::project;
@@ -44,6 +44,9 @@ pub struct SecretStatus {
     pub ai: bool,
 }
 
+/// (获取时间, [(项目 ID, 名称)])
+type ManagedProjects = (std::time::Instant, Vec<(u64, String)>);
+
 pub struct Service {
     pub paths: Paths,
     pub db: Db,
@@ -57,6 +60,10 @@ pub struct Service {
     assignees: RwLock<HashMap<u64, (std::time::Instant, Vec<Assignee>)>>,
     /// 项目总览缓存：项目 ID → (获取时间, 总览)
     overviews: RwLock<HashMap<u64, (std::time::Instant, ProjectOverview)>>,
+    /// 推荐负责人用的项目数据：项目 ID → (获取时间, 数据)
+    assign_ctxs: RwLock<HashMap<u64, (std::time::Instant, Arc<AssignCtx>)>>,
+    /// 拉取未指派任务的项目
+    managed: RwLock<Option<ManagedProjects>>,
     sync_lock: AsyncMutex<()>,
     events: broadcast::Sender<AppEvent>,
 }
@@ -87,6 +94,8 @@ impl Service {
             statuses: RwLock::new(Vec::new()),
             assignees: RwLock::new(HashMap::new()),
             overviews: RwLock::new(HashMap::new()),
+            assign_ctxs: RwLock::new(HashMap::new()),
+            managed: RwLock::new(None),
             sync_lock: AsyncMutex::new(()),
             events,
         }))
@@ -135,9 +144,12 @@ impl Service {
             || old.redmine.proxy != cfg.redmine.proxy
             || old.redmine.accept_invalid_certs != cfg.redmine.accept_invalid_certs;
         let rules_changed = serde_json::to_string(&old.rules)? != serde_json::to_string(&cfg.rules)?;
+        let dispatch_scope_changed = old.dispatch.project_ids != cfg.dispatch.project_ids;
         write(&self.config, cfg);
         if redmine_changed {
             self.reset_redmine_cache();
+        } else if dispatch_scope_changed {
+            write(&self.managed, None);
         }
         if rules_changed {
             self.reapply_rules()?;
@@ -160,6 +172,8 @@ impl Service {
         write(&self.statuses, Vec::new());
         write(&self.assignees, HashMap::new());
         write(&self.overviews, HashMap::new());
+        write(&self.assign_ctxs, HashMap::new());
+        write(&self.managed, None);
     }
 
     pub fn secret(&self, kind: SecretKind) -> Result<Option<String>> {
@@ -331,12 +345,15 @@ impl Service {
         let cfg = self.config();
         let rm = self.redmine()?;
         let s = &cfg.sync;
-        if !s.assigned_to_me && !s.watched && s.query_id.is_none() {
+        // 分派台的计数要用到当前用户和状态列表（都会缓存，只在第一次请求）
+        let _ = self.me().await;
+        let _ = self.statuses().await;
+        if !s.assigned_to_me && !s.watched && s.query_id.is_none() && !s.managed_unassigned {
             return Err(coded("SYNC_SCOPE", "请在设置中至少选择一种同步范围"));
         }
         let project = Some(s.project.trim().to_string()).filter(|p| !p.is_empty());
         let base = IssueQuery {
-            project,
+            project: project.clone(),
             status: "open".into(),
             ..Default::default()
         };
@@ -353,9 +370,27 @@ impl Service {
             let q = IssueQuery { query_id: Some(qid), ..base.clone() };
             all.extend(rm.list_issues(&q).await?.into_iter().map(|i| (i.id, i)));
         }
+        // 我管理的项目里没人负责的任务，进入分派台。拉取失败不影响其他同步结果
+        let mut unassigned: HashSet<u64> = HashSet::new();
+        if s.managed_unassigned {
+            match self.managed_unassigned(&rm, project).await {
+                Ok(list) => {
+                    for i in list {
+                        unassigned.insert(i.id);
+                        all.entry(i.id).or_insert(i);
+                    }
+                }
+                Err(e) => tracing::warn!("拉取未指派任务失败: {e}"),
+            }
+        }
         let issues: Vec<Issue> = all.into_values().collect();
         let diff = self.db.apply_sync(&issues)?;
-        let new_ids = diff.new_ids;
+        let mut new_ids = diff.new_ids;
+        // 第一次拉取未指派任务时，已有的积压不算新任务，避免一次弹出大量通知
+        if !unassigned.is_empty() && self.db.kv_get("unassigned_seeded")?.is_none() {
+            new_ids.retain(|id| !unassigned.contains(id));
+            self.db.kv_set("unassigned_seeded", "1")?;
+        }
         let updated_ids: Vec<u64> = diff.updated.iter().map(|p| p.id).collect();
 
         let changed: HashSet<u64> = new_ids.iter().chain(updated_ids.iter()).copied().collect();
@@ -380,6 +415,12 @@ impl Service {
                     tracing::warn!("自动分析失败: {e}");
                 }
             });
+        }
+        // 提前读好分派台要用的成员和历史；新进入分派台的任务顺带让 AI 给出派单建议
+        {
+            let svc = Arc::clone(self);
+            let fresh: Vec<u64> = if s.auto_analyze && self.ai_ready() { new_ids.clone() } else { vec![] };
+            tokio::spawn(async move { svc.prepare_dispatch(&fresh).await });
         }
 
         Ok(SyncReport {
@@ -905,6 +946,7 @@ impl Service {
                     done_ratio,
                     private_notes: req.private_notes,
                     files,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -1070,7 +1112,7 @@ impl Service {
     }
 
     async fn apply_update(&self, id: u64, plan: UpdatePlan) -> Result<ResolveOutcome> {
-        let UpdatePlan { notes, status_id, assign_to_author, assign_to, done_ratio, private_notes, files } = plan;
+        let UpdatePlan { notes, status_id, assign_to_author, assign_to, done_ratio, private_notes, files, due_date, category_id } = plan;
         let rm = self.redmine()?;
         let issue = rm.get_issue(id).await?;
         let me = self.me().await.ok();
@@ -1130,6 +1172,8 @@ impl Service {
                 status_id,
                 assigned_to_id: assignee.as_ref().map(|a| a.id),
                 done_ratio,
+                due_date,
+                category_id,
                 uploads,
             },
         )
@@ -1201,14 +1245,7 @@ impl Service {
 
         let mut members = self.assignees(project_id).await.unwrap_or_default();
         if members.is_empty() {
-            // 没有权限查看成员时，用当前任务的负责人作为候选
-            for i in &issues {
-                if let Some(id) = i.assignee_id {
-                    if !members.iter().any(|m| m.id == id) {
-                        members.push(Assignee { id, name: i.assignee.clone(), is_group: false, roles: vec![] });
-                    }
-                }
-            }
+            members = members_from_issues(&issues);
         }
 
         let mut versions: Vec<_> = rm
@@ -1382,7 +1419,7 @@ impl Service {
         if cands.is_empty() {
             return Ok(local);
         }
-        let mut body = members_brief(&cands, ov, load);
+        let mut body = members_brief(&cands, &ov.issues, load, &HashMap::new());
         let defaults: Vec<String> = categories
             .iter()
             .filter_map(|c| c.assigned_to.as_ref().map(|a| format!("{} → {}", c.name, a.name)))
@@ -1547,7 +1584,7 @@ impl Service {
         if cands.is_empty() {
             return Err(coded("NO_MEMBERS", "无法读取项目成员，请手动拆分"));
         }
-        let mut body = members_brief(&cands, ov, load);
+        let mut body = members_brief(&cands, &ov.issues, load, &HashMap::new());
         if !categories.is_empty() {
             let list: Vec<String> = categories
                 .iter()
@@ -1631,6 +1668,19 @@ impl Service {
 
     /// 创建子任务并分别指派。逐个创建，单个失败不影响其他；可选在原任务添加拆分说明。
     pub async fn split_issue(&self, issue_id: u64, parts: &[SplitPart], add_note: bool) -> Result<SplitOutcome> {
+        Ok(self.split_inner(issue_id, parts, add_note, None, None).await?.0)
+    }
+
+    /// 拆分的实现。`due` 在原任务没有截止日期时用作子任务的截止日期，`extra` 附在每个子任务描述后面。
+    /// 另外返回每个已创建子任务的分工方向（与 `created` 一一对应）。
+    async fn split_inner(
+        &self,
+        issue_id: u64,
+        parts: &[SplitPart],
+        add_note: bool,
+        due: Option<String>,
+        extra: Option<&str>,
+    ) -> Result<(SplitOutcome, Vec<String>)> {
         let parts: Vec<&SplitPart> = parts.iter().filter(|p| !p.subject.trim().is_empty()).collect();
         if parts.is_empty() {
             return Err(coded("SPLIT_EMPTY", "请至少填写一个子任务标题"));
@@ -1649,6 +1699,8 @@ impl Service {
             .map(|c| (c.id, c.value.clone()))
             .collect();
         let mut out = SplitOutcome { issue_id, ..Default::default() };
+        let mut roles = Vec::new();
+        let extra = extra.map(str::trim).filter(|x| !x.is_empty());
         // 同一批子任务的跟踪类型相同：父任务字段或自定义字段被拒绝一次后，后面的不再带上
         let mut as_subtask = true;
         let mut with_custom = true;
@@ -1659,11 +1711,14 @@ impl Service {
                 priority_id: parent.priority.as_ref().map(|t| t.id),
                 parent_issue_id: as_subtask.then_some(issue_id),
                 subject: p.subject.trim().to_string(),
-                description: p.description.trim().to_string(),
+                description: match extra {
+                    Some(x) => format!("{}\n\n{x}", p.description.trim()).trim().to_string(),
+                    None => p.description.trim().to_string(),
+                },
                 assigned_to_id: p.assignee_id,
                 category_id: p.category_id.or(parent.category.as_ref().map(|c| c.id)),
                 fixed_version_id: parent.fixed_version.as_ref().map(|v| v.id),
-                due_date: parent.due_date.clone(),
+                due_date: parent.due_date.clone().or_else(|| due.clone()),
                 estimated_hours: p.estimated_hours,
                 custom_fields: if with_custom { custom.clone() } else { vec![] },
             };
@@ -1701,6 +1756,7 @@ impl Service {
                         }
                     }
                     out.created.push(c);
+                    roles.push(p.role.clone());
                 }
                 Err(e) => out.failed.push(format!("{}：{}", truncate(p.subject.trim(), 40), plain_error(&e))),
             }
@@ -1726,7 +1782,680 @@ impl Service {
             }
         }
         write(&self.overviews, HashMap::new());
+        // 新的子任务改变了负载，原任务也有了子任务
+        self.assign_ctxs.write().unwrap_or_else(|e| e.into_inner()).remove(&parent.project.id);
         self.emit(AppEvent::IssuesChanged);
+        Ok((out, roles))
+    }
+
+    // ---------------- 分派台 ----------------
+
+    /// 拉取未指派任务的项目：设置里指定的，否则是我担任管理角色的项目（缓存 30 分钟）
+    async fn dispatch_projects(&self) -> Result<Vec<(u64, String)>> {
+        if let Some((at, list)) = read(&self.managed) {
+            if at.elapsed() < Duration::from_secs(1800) {
+                return Ok(list);
+            }
+        }
+        let ids = self.config().dispatch.project_ids;
+        let (_, mine) = self.redmine()?.my_projects().await?;
+        let list: Vec<(u64, String)> = if ids.is_empty() {
+            mine.iter()
+                .filter(|p| p.roles.iter().any(|r| project::is_manager_role(r)))
+                .map(|p| (p.id, p.name.clone()))
+                .collect()
+        } else {
+            ids.iter()
+                .map(|id| (*id, mine.iter().find(|p| p.id == *id).map(|p| p.name.clone()).unwrap_or_else(|| format!("项目 #{id}"))))
+                .collect()
+        };
+        write(&self.managed, Some((std::time::Instant::now(), list.clone())));
+        Ok(list)
+    }
+
+    /// 我管理的项目里未指派的未关闭任务（同步时限定了项目就只看那个项目）
+    async fn managed_unassigned(&self, rm: &RedmineClient, only: Option<String>) -> Result<Vec<Issue>> {
+        let projects: Vec<String> = match only {
+            Some(p) => vec![p],
+            None => self.dispatch_projects().await?.into_iter().map(|(id, _)| id.to_string()).collect(),
+        };
+        let mut out = Vec::new();
+        for p in projects {
+            let q = IssueQuery {
+                project: Some(p),
+                status: "open".into(),
+                extra: vec![("assigned_to_id", "!*".into())],
+                max_results: 300,
+                ..Default::default()
+            };
+            out.extend(rm.list_issues(&q).await?);
+        }
+        Ok(out)
+    }
+
+    /// 推荐负责人用到的项目数据（缓存 10 分钟）。项目总览刚读过时直接复用。
+    async fn assign_ctx(&self, project_id: u64) -> Result<Arc<AssignCtx>> {
+        if let Some((at, c)) = self.assign_ctxs.read().unwrap_or_else(|e| e.into_inner()).get(&project_id) {
+            if at.elapsed() < Duration::from_secs(600) {
+                return Ok(Arc::clone(c));
+            }
+        }
+        let rm = self.redmine()?;
+        let cached = self
+            .overviews
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&project_id)
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(300))
+            .map(|(_, ov)| ov.clone());
+        let ov = match cached {
+            Some(ov) => ov,
+            None => {
+                let today = chrono::Local::now().date_naive();
+                let open = rm
+                    .list_issues(&IssueQuery { project: Some(project_id.to_string()), status: "open".into(), ..Default::default() })
+                    .await?;
+                let issues: Vec<ProjectIssue> = open.iter().map(|i| project::to_project_issue(i, today)).collect();
+                let mut members = self.assignees(project_id).await.unwrap_or_default();
+                if members.is_empty() {
+                    members = members_from_issues(&issues);
+                }
+                ProjectOverview {
+                    project_id,
+                    fetched_at: db::now_rfc3339(),
+                    issues,
+                    truncated: false,
+                    members,
+                    versions: vec![],
+                    weekly: vec![],
+                }
+            }
+        };
+        let (categories, refs, load) = self.assign_refs(&rm, &ov).await;
+        let guessed = project::guess_roles(&ov.members, &refs);
+        let parents: HashSet<u64> = ov.issues.iter().filter_map(|i| i.parent_id).collect();
+        let ctx = Arc::new(AssignCtx { members: ov.members, categories, open: ov.issues, refs, load, guessed, parents });
+        self.assign_ctxs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(project_id, (std::time::Instant::now(), Arc::clone(&ctx)));
+        Ok(ctx)
+    }
+
+    /// 并发读取多个项目的推荐数据
+    async fn assign_ctxs_for(self: &Arc<Self>, project_ids: &[u64]) -> HashMap<u64, std::result::Result<Arc<AssignCtx>, String>> {
+        let sem = Arc::new(Semaphore::new(3));
+        let mut set = tokio::task::JoinSet::new();
+        for &pid in project_ids {
+            let svc = Arc::clone(self);
+            let sem = Arc::clone(&sem);
+            set.spawn(async move {
+                let _permit = sem.acquire().await;
+                (pid, svc.assign_ctx(pid).await.map_err(|e| plain_error(&e)))
+            });
+        }
+        let mut out = HashMap::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((pid, r)) = joined {
+                out.insert(pid, r);
+            }
+        }
+        out
+    }
+
+    /// 派单后更新缓存里的负载，下一个任务的推荐马上能考虑到
+    fn bump_load(&self, project_id: u64, ids: &[u64]) {
+        let mut map = self.assign_ctxs.write().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, ctx)) = map.get_mut(&project_id) {
+            let c = Arc::make_mut(ctx);
+            for id in ids {
+                *c.load.entry(*id).or_default() += 1;
+            }
+        }
+    }
+
+    /// 已缓存的项目数据里，有未关闭子任务的任务
+    fn split_parents(&self) -> HashSet<u64> {
+        self
+            .assign_ctxs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .flat_map(|(_, c)| c.parents.iter().copied())
+            .collect()
+    }
+
+    /// 收件箱里等待分派的任务：指派给我且处于待分派状态的，以及没有指派的；
+    /// 去掉留给自己处理、已拆分（标记过或有未关闭子任务）的。用缓存的当前用户和状态，拿不到时只算未指派的。
+    fn queue_views(&self) -> Result<Vec<IssueView>> {
+        let me = read(&self.me).map(|u| u.id);
+        let parents = self.split_parents();
+        let statuses = read(&self.statuses);
+        let pending: HashSet<u64> = project::pending_statuses(&statuses, &self.config().dispatch.pending_status_ids)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        let marks = self.db.dispatch_marks()?;
+        Ok(self
+            .db
+            .list_views(&IssueFilter::default())?
+            .into_iter()
+            .filter(|v| !marks.contains_key(&v.id) && !parents.contains(&v.id))
+            .filter(|v| match v.assigned_to_id {
+                None => true,
+                Some(a) => me == Some(a) && pending.contains(&v.status_id),
+            })
+            .collect())
+    }
+
+    /// 分派台中的任务号（用本地缓存，不访问 Redmine）
+    pub fn dispatch_pending_ids(&self) -> Vec<u64> {
+        self.queue_views().map(|v| v.into_iter().map(|x| x.id).collect()).unwrap_or_default()
+    }
+
+    /// 分派台：待分派的任务、推荐的负责人（单人或多人分工），以及各项目可选的成员
+    pub async fn dispatch_queue(self: &Arc<Self>) -> Result<DispatchQueue> {
+        // 先确保当前用户和状态列表已缓存，queue_views 依赖它们
+        let _ = self.me().await;
+        let statuses = self.statuses().await.unwrap_or_default();
+        let views = self.queue_views()?;
+        let mut q = self.build_dispatch(views).await;
+        // 读到项目数据后再去掉有子任务的（第一次打开时还没有缓存）
+        let parents = self.split_parents();
+        q.items.retain(|i| !parents.contains(&i.issue.id));
+        q.pending_statuses = project::pending_statuses(&statuses, &self.config().dispatch.pending_status_ids)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        Ok(q)
+    }
+
+    /// 单个任务的派单建议（收件箱、项目总览里点“转派”时用，任务不必在分派台里）
+    pub async fn dispatch_preview(self: &Arc<Self>, issue_id: u64) -> Result<DispatchQueue> {
+        let _ = self.me().await;
+        let view = match self.db.get_view(issue_id)? {
+            Some(v) => v,
+            None => view_from_issue(&self.detail(issue_id, false).await?),
+        };
+        Ok(self.build_dispatch(vec![view]).await)
+    }
+
+    async fn build_dispatch(self: &Arc<Self>, mut views: Vec<IssueView>) -> DispatchQueue {
+        let cfg = self.config();
+        let me = read(&self.me).map(|u| u.id);
+        let today = chrono::Local::now().date_naive();
+        // 优先级高的在前，同优先级先来的在前
+        views.sort_by(|a, b| b.priority_id.cmp(&a.priority_id).then_with(|| a.created_on.cmp(&b.created_on)).then(a.id.cmp(&b.id)));
+        let mut pids: Vec<(u64, String)> = Vec::new();
+        for v in &views {
+            if !pids.iter().any(|p| p.0 == v.project_id) {
+                pids.push((v.project_id, v.project_name.clone()));
+            }
+        }
+        let ids: Vec<u64> = pids.iter().map(|p| p.0).collect();
+        let ctxs = self.assign_ctxs_for(&ids).await;
+        let counts = self.db.dispatch_counts(60).unwrap_or_default();
+        let ai = self.db.dispatch_ai(&views.iter().map(|v| v.id).collect::<Vec<_>>()).unwrap_or_default();
+
+        let mut projects = Vec::new();
+        let mut contexts: HashMap<u64, (Arc<AssignCtx>, HashMap<u64, String>)> = HashMap::new();
+        for (pid, name) in &pids {
+            let (ctx, error) = match ctxs.get(pid) {
+                Some(Ok(c)) => (Arc::clone(c), None),
+                Some(Err(e)) => {
+                    // 读不了项目任务时仍然给出成员，可以手动派
+                    let members = self.assignees(*pid).await.unwrap_or_default();
+                    let c = AssignCtx { members, ..Default::default() };
+                    (Arc::new(c), Some(format!("读取项目任务失败，推荐可能不准：{e}")))
+                }
+                None => (Arc::new(AssignCtx::default()), Some("读取项目信息失败".into())),
+            };
+            let roles = member_roles(&ctx.members, &cfg.dispatch.team, &ctx.guessed);
+            projects.push(DispatchProject {
+                id: *pid,
+                name: name.clone(),
+                members: dispatch_members(&ctx, &roles, &cfg.dispatch.team, me, &counts),
+                categories: ctx.categories.iter().map(|c| NamedId { id: c.id, name: c.name.clone(), is_closed: None }).collect(),
+                error,
+            });
+            let plain: HashMap<u64, String> = roles.into_iter().map(|(k, (r, _))| (k, r)).collect();
+            contexts.insert(*pid, (ctx, plain));
+        }
+
+        let items = views
+            .into_iter()
+            .map(|v| {
+                let (ctx, roles) = &contexts[&v.project_id];
+                let target = ProjectIssue {
+                    id: v.id,
+                    project_name: v.project_name.clone(),
+                    subject: v.subject.clone(),
+                    description: truncate(v.description.trim(), 2000),
+                    tracker: v.tracker_name.clone(),
+                    priority_id: v.priority_id,
+                    priority: v.priority_name.clone(),
+                    author_id: v.author_id,
+                    author: v.author_name.clone(),
+                    category_id: v.redmine_category_id,
+                    category: v.redmine_category.clone(),
+                    ..Default::default()
+                };
+                let items = project::split_items(&v.description);
+                let mut suggestion = if ctx.members.is_empty() {
+                    None
+                } else {
+                    project::suggest_with_roles(std::slice::from_ref(&target), &ctx.refs, &ctx.members, &ctx.categories, &ctx.load, roles)
+                        .into_iter()
+                        .next()
+                        .filter(|s| s.assignee_id.is_some())
+                };
+                let mut multi = project::multi_plan(&target, &items, &ctx.refs, &ctx.members, &ctx.categories, &ctx.load, roles);
+                // AI 的建议（任务之后没有更新过）优先
+                if let Some((_, json)) = ai.get(&v.id).filter(|(u, _)| *u == v.updated_on) {
+                    if let Ok(r) = serde_json::from_str::<AiDispatch>(json) {
+                        let cands = project::candidates(&ctx.members);
+                        if let Some(c) = cands.iter().find(|c| c.id == r.assignee_id) {
+                            suggestion = Some(AssignSuggestion {
+                                issue_id: v.id,
+                                assignee_id: Some(c.id),
+                                assignee_name: c.name.clone(),
+                                reason: r.reason.clone(),
+                                source: "ai".into(),
+                            });
+                        }
+                        let parts: Vec<SplitPart> = r
+                            .parts
+                            .iter()
+                            .filter_map(|p| {
+                                let c = cands.iter().find(|c| c.id == p.assignee_id)?;
+                                Some(SplitPart {
+                                    subject: if p.subject.trim().is_empty() { format!("{}（{}）", truncate(&v.subject, 50), p.role) } else { p.subject.clone() },
+                                    description: p.description.clone(),
+                                    assignee_id: Some(c.id),
+                                    assignee_name: c.name.clone(),
+                                    reason: p.reason.clone(),
+                                    source: "ai".into(),
+                                    role: p.role.clone(),
+                                    ..Default::default()
+                                })
+                            })
+                            .collect();
+                        let distinct: HashSet<u64> = parts.iter().filter_map(|p| p.assignee_id).collect();
+                        // AI 认为一个人就够时，去掉本地算法的多人方案
+                        multi = (distinct.len() >= 2).then(|| MultiPlan { parts, reason: r.reason.clone(), source: "ai".into() });
+                    }
+                }
+                let default_due = if v.due_date.is_none() {
+                    project::default_due(&v.priority_name, &cfg.dispatch.due_days, today).map(|d| d.format("%Y-%m-%d").to_string())
+                } else {
+                    None
+                };
+                DispatchItem { item_count: items.len(), issue: v, suggestion, multi, default_due }
+            })
+            .collect();
+        DispatchQueue { items, projects, me_id: me, pending_statuses: vec![] }
+    }
+
+    /// 同步后的准备：读取分派台涉及项目的推荐数据；`fresh` 中进入分派台的新任务让 AI 给出派单建议
+    async fn prepare_dispatch(self: &Arc<Self>, fresh: &[u64]) {
+        let Ok(views) = self.queue_views() else { return };
+        if views.is_empty() {
+            return;
+        }
+        let mut pids: Vec<u64> = views.iter().map(|v| v.project_id).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        let _ = self.assign_ctxs_for(&pids).await;
+        let ids: Vec<u64> = views.iter().map(|v| v.id).filter(|id| fresh.contains(id)).collect();
+        if !ids.is_empty() {
+            match self.ai_dispatch(&ids).await {
+                Ok(n) if n > 0 => self.emit(AppEvent::IssuesChanged),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("AI 派单建议失败: {e}"),
+            }
+        }
+    }
+
+    /// 让 AI 为这些任务给出派单建议（单人或多人分工），结果保存到本地，返回得到建议的任务数
+    pub async fn ai_dispatch(self: &Arc<Self>, issue_ids: &[u64]) -> Result<usize> {
+        let cfg = self.config();
+        let ai = self.ai_client(true)?;
+        let mut views: Vec<IssueView> = Vec::new();
+        for id in issue_ids.iter().take(30) {
+            match self.db.get_view(*id)? {
+                Some(v) => views.push(v),
+                None => views.push(view_from_issue(&self.detail(*id, false).await?)),
+            }
+        }
+        let excluded: Vec<u64> = views.iter().filter(|v| cfg.ai.excluded_project_ids.contains(&v.project_id)).map(|v| v.id).collect();
+        views.retain(|v| !excluded.contains(&v.id));
+        if views.is_empty() {
+            return Err(coded("AI_EXCLUDED", "这些任务所属项目已设置为不发送给 AI"));
+        }
+        let q = self.build_dispatch(views.clone()).await;
+        let mut done = 0;
+        for proj in &q.projects {
+            let Ok(ctx) = self.assign_ctx(proj.id).await else { continue };
+            let roles: HashMap<u64, String> = proj.members.iter().filter(|m| !m.role.is_empty()).map(|m| (m.id, m.role.clone())).collect();
+            let cands = project::candidates(&ctx.members);
+            if cands.is_empty() {
+                continue;
+            }
+            let mut body = members_brief(&cands, &ctx.open, &ctx.load, &roles);
+            let defaults: Vec<String> = ctx
+                .categories
+                .iter()
+                .filter_map(|c| c.assigned_to.as_ref().map(|a| format!("{} → {}", c.name, a.name)))
+                .collect();
+            if !defaults.is_empty() {
+                body.push_str(&format!("\n类别默认负责人：{}\n", defaults.join("；")));
+            }
+            let items: Vec<&DispatchItem> = q.items.iter().filter(|i| i.issue.project_id == proj.id).collect();
+            body.push_str("\n本地算法的推荐（仅供参考）：\n");
+            for i in &items {
+                let single = i.suggestion.as_ref().map(|s| format!("{}（{}）", s.assignee_name, s.reason)).unwrap_or_else(|| "无".into());
+                let multi = i
+                    .multi
+                    .as_ref()
+                    .map(|m| {
+                        let who: Vec<String> = m.parts.iter().map(|p| format!("{} {}", p.role, p.assignee_name)).collect();
+                        format!("；可能需要多人：{}（{}）", who.join(" + "), m.reason)
+                    })
+                    .unwrap_or_default();
+                body.push_str(&format!("- #{} → {single}{multi}\n", i.issue.id));
+            }
+            body.push_str("\n待分派任务：\n");
+            for i in &items {
+                let v = &i.issue;
+                body.push_str(&format!(
+                    "### #{} [{} / {}] 优先级：{} 提出人：{}\n标题：{}\n描述：{}\n\n",
+                    v.id,
+                    v.tracker_name,
+                    v.redmine_category.as_deref().unwrap_or("无类别"),
+                    v.priority_name,
+                    v.author_name,
+                    v.subject,
+                    truncate(&v.description, 600)
+                ));
+            }
+            let msgs = vec![
+                Message::system(prompts::with_extra(prompts::dispatch_system(), &cfg.ai.custom_prompts.plan)),
+                Message::user(self.prep_for_ai(&body)),
+            ];
+            let (v, usage) = ai.chat_json::<Value>(&msgs).await?;
+            self.record_usage("dispatch", &ai.model, usage);
+            for item in v["items"].as_array().cloned().unwrap_or_default() {
+                let (Some(iid), Some(aid)) = (v_u64(&item["issueId"]), v_u64(&item["assigneeId"])) else { continue };
+                let Some(target) = items.iter().find(|i| i.issue.id == iid) else { continue };
+                if !cands.iter().any(|c| c.id == aid) {
+                    continue;
+                }
+                let parts: Vec<AiPart> = item["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .take(4)
+                    .filter_map(|p| {
+                        Some(AiPart {
+                            role: v_str(&p["role"]).unwrap_or_default(),
+                            assignee_id: v_u64(&p["assigneeId"]).filter(|id| cands.iter().any(|c| c.id == *id))?,
+                            subject: v_str(&p["subject"]).map(|s| truncate(&s, 120)).unwrap_or_default(),
+                            description: v_str(&p["description"]).unwrap_or_default(),
+                            reason: v_str(&p["reason"]).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                let r = AiDispatch { assignee_id: aid, reason: v_str(&item["reason"]).unwrap_or_else(|| "AI 推荐".into()), parts };
+                self.db.save_dispatch_ai(iid, &target.issue.updated_on, &serde_json::to_string(&r)?)?;
+                done += 1;
+            }
+        }
+        Ok(done)
+    }
+
+    /// 派单：指派给一个人；或拆成子任务分给多人；或一人负责、其他人协作（加为关注人）。
+    /// 可同时设置截止日期、状态、类别，并把我加为关注人。
+    pub async fn dispatch(&self, req: &DispatchRequest) -> Result<DispatchOutcome> {
+        let cfg = self.config();
+        let rm = self.redmine()?;
+        let me = self.me().await.ok();
+        let me_id = me.as_ref().map(|m| m.id);
+        let id = req.issue_id;
+        let issue = rm.get_issue(id).await?;
+        let watch = req.watch.unwrap_or(cfg.dispatch.watch);
+        let mut early_warnings = Vec::new();
+        // 设置里的“派单后状态”工作流不允许时跳过，不让整个派单失败；明确指定的状态仍由 apply_update 校验
+        let default_status = cfg.dispatch.assigned_status_id.filter(|s| {
+            let ok = issue.allowed_statuses.is_empty() || issue.allowed_statuses.iter().any(|a| a.id == *s);
+            if !ok {
+                early_warnings.push(format!("工作流不允许从“{}”改为设置里的派单后状态，状态未修改", issue.status.name));
+            }
+            ok
+        });
+        let status_id = req.status_id.or(default_status).filter(|s| *s != issue.status.id);
+        let notes = req.notes.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        let due = match &req.due_date {
+            Some(d) => Some(d.clone()),
+            None if req.auto_due && issue.due_date.is_none() => {
+                let p = issue.priority.as_ref().map(|p| p.name.as_str()).unwrap_or("");
+                project::default_due(p, &cfg.dispatch.due_days, chrono::Local::now().date_naive()).map(|d| d.format("%Y-%m-%d").to_string())
+            }
+            None => None,
+        }
+        .filter(|d| issue.due_date.as_deref() != Some(d.as_str()));
+        if let Some(d) = &due {
+            if chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_err() {
+                return Err(coded("DUE_INVALID", format!("截止日期格式不对：{d}（应为 YYYY-MM-DD）")));
+            }
+        }
+        let members = self.assignees(issue.project.id).await.unwrap_or_default();
+        let name_of = |uid: u64| {
+            members
+                .iter()
+                .find(|m| m.id == uid)
+                .map(|m| m.name.clone())
+                .or_else(|| me.as_ref().filter(|m| m.id == uid).map(|m| m.display_name()))
+                .unwrap_or_else(|| format!("成员 #{uid}"))
+        };
+        let mode = if req.mode.is_empty() { "single" } else { req.mode.as_str() };
+        let mut out = DispatchOutcome { issue_id: id, ok: true, mode: mode.into(), warnings: early_warnings, ..Default::default() };
+        let mut assigned: Vec<(u64, String)> = Vec::new();
+        let mut child_ids: Vec<u64> = Vec::new();
+
+        match mode {
+            "single" | "assist" => {
+                let Some(lead) = req.assignee_id else {
+                    return Err(coded("DISPATCH_NO_ASSIGNEE", "请选择负责人"));
+                };
+                let mut helpers: Vec<u64> = Vec::new();
+                if mode == "assist" {
+                    for c in &req.collaborator_ids {
+                        if *c != lead && !helpers.contains(c) {
+                            helpers.push(*c);
+                        }
+                    }
+                }
+                let notes = if helpers.is_empty() {
+                    notes
+                } else {
+                    let names: Vec<String> = helpers.iter().map(|h| name_of(*h)).collect();
+                    let line = format!("由 {} 负责，{} 协作。", name_of(lead), names.join("、"));
+                    Some(match notes {
+                        Some(n) => format!("{n}\n\n{line}"),
+                        None => line,
+                    })
+                };
+                let res = self
+                    .apply_update(
+                        id,
+                        UpdatePlan { notes, status_id, assign_to: Some(lead), due_date: due.clone(), category_id: req.category_id, ..Default::default() },
+                    )
+                    .await?;
+                out.warnings.extend(res.warnings);
+                assigned.push((lead, res.assigned_to.unwrap_or_else(|| name_of(lead))));
+                for h in helpers {
+                    match rm.add_watcher(id, h).await {
+                        Ok(()) => assigned.push((h, name_of(h))),
+                        Err(e) => out.warnings.push(format!("无法把 {} 加为关注人：{}", name_of(h), plain_error(&e))),
+                    }
+                }
+                if lead == me_id.unwrap_or(0) {
+                    self.db.set_dispatch_mark(id, "keep")?;
+                } else if watch {
+                    if let Some(m) = me_id.filter(|m| !issue.watchers.iter().any(|w| w.id == *m)) {
+                        if let Err(e) = rm.add_watcher(id, m).await {
+                            out.warnings.push(format!("没能把你加为关注人（{}），后续进度请在 Redmine 中关注", plain_error(&e)));
+                        }
+                    }
+                }
+            }
+            "split" => {
+                let (so, roles) = self.split_inner(id, &req.parts, true, due.clone(), notes.as_deref()).await?;
+                if so.created.is_empty() {
+                    return Err(coded("SPLIT_FAILED", format!("子任务都没有创建成功：{}", so.failed.join("；"))));
+                }
+                out.warnings.extend(so.failed.iter().map(|f| format!("未创建：{f}")));
+                out.warnings.extend(so.warnings.iter().cloned());
+                // 原任务留在我名下跟踪
+                let to_me = me_id.filter(|m| issue.assigned_to.as_ref().map(|a| a.id) != Some(*m));
+                let parent_due = due.clone().filter(|_| issue.due_date.is_none());
+                if to_me.is_some() || status_id.is_some() || parent_due.is_some() || req.category_id.is_some() {
+                    let plan = UpdatePlan { status_id, assign_to: to_me, due_date: parent_due, category_id: req.category_id, ..Default::default() };
+                    if let Err(e) = self.apply_update(id, plan).await {
+                        out.warnings.push(format!("子任务已创建，但更新原任务失败：{}", plain_error(&e)));
+                    }
+                }
+                // 子任务对应的负责人（按标题对应回提交的方案）
+                let owners: Vec<u64> = so
+                    .created
+                    .iter()
+                    .map(|c| req.parts.iter().find(|p| p.subject.trim() == c.subject.trim()).and_then(|p| p.assignee_id).unwrap_or(0))
+                    .collect();
+                if watch {
+                    if let Some(m) = me_id {
+                        let mut failed = 0;
+                        for (c, who) in so.created.iter().zip(&owners) {
+                            if *who != m && rm.add_watcher(c.id, m).await.is_err() {
+                                failed += 1;
+                            }
+                        }
+                        if failed > 0 {
+                            out.warnings.push(format!("{failed} 个子任务没能把你加为关注人，可以在原任务的子任务列表里跟踪进度"));
+                        }
+                    }
+                }
+                if req.frontend_waits {
+                    let pick = |r: &str| -> Vec<u64> { so.created.iter().zip(&roles).filter(|(_, x)| x.as_str() == r).map(|(c, _)| c.id).collect() };
+                    let (fe, be) = (pick("前端"), pick("后端"));
+                    if fe.is_empty() || be.is_empty() {
+                        out.warnings.push("没有同时找到前端和后端子任务，未建立先后关系".into());
+                    }
+                    for b in &be {
+                        for f in &fe {
+                            if let Err(e) = rm.create_relation(*b, *f, "blocks").await {
+                                out.warnings.push(format!("#{b} 阻挡 #{f} 的关联没有建立：{}", plain_error(&e)));
+                            }
+                        }
+                    }
+                }
+                for (c, who) in so.created.iter().zip(&owners) {
+                    child_ids.push(c.id);
+                    assigned.push((*who, if c.assignee.is_empty() { "未指派".into() } else { c.assignee.clone() }));
+                }
+                out.created = so.created;
+                self.db.set_dispatch_mark(id, "split")?;
+            }
+            other => return Err(coded("DISPATCH_MODE", format!("不支持的派单方式：{other}"))),
+        }
+
+        out.assigned_to = assigned.iter().map(|a| a.1.clone()).collect();
+        if let Err(e) = self.db.add_dispatch(id, &issue.subject, mode, &assigned, &child_ids, due.as_deref(), req.suggested_id) {
+            tracing::warn!("记录派单失败: {e}");
+        }
+        let ids: Vec<u64> = assigned.iter().map(|a| a.0).filter(|a| *a != 0).collect();
+        self.bump_load(issue.project.id, &ids);
+        write(&self.overviews, HashMap::new());
+        self.emit(AppEvent::IssuesChanged);
+        Ok(out)
+    }
+
+    /// 批量派单，逐个执行，单个失败不影响其他
+    pub async fn dispatch_batch(&self, reqs: &[DispatchRequest]) -> Vec<DispatchOutcome> {
+        let mut outs = Vec::new();
+        for r in reqs {
+            outs.push(match self.dispatch(r).await {
+                Ok(o) => o,
+                Err(e) => DispatchOutcome { issue_id: r.issue_id, ok: false, mode: r.mode.clone(), error: Some(e.to_string()), ..Default::default() },
+            });
+        }
+        outs
+    }
+
+    /// 留给自己处理：不再出现在分派台
+    pub fn dispatch_keep(&self, id: u64) -> Result<()> {
+        self.db.set_dispatch_mark(id, "keep")?;
+        self.emit(AppEvent::IssuesChanged);
+        Ok(())
+    }
+
+    /// 撤销“留给自己”，重新回到分派台
+    pub fn dispatch_unmark(&self, id: u64) -> Result<()> {
+        self.db.clear_dispatch_mark(id)?;
+        self.emit(AppEvent::IssuesChanged);
+        Ok(())
+    }
+
+    /// 标为重复：建立“重复”关联（原任务关闭时 Redmine 会一并关闭它），可附说明和改状态
+    pub async fn mark_duplicate(&self, id: u64, original: u64, notes: Option<String>, status_id: Option<u64>) -> Result<ResolveOutcome> {
+        if id == original {
+            return Err(coded("DUPLICATE_SELF", "不能标为与自己重复"));
+        }
+        let rm = self.redmine()?;
+        rm.create_relation(id, original, "duplicates").await?;
+        let notes = notes.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("与 #{original} 重复，请在 #{original} 中跟进。"));
+        let out = self.apply_update(id, UpdatePlan { notes: Some(notes), status_id, ..Default::default() }).await?;
+        self.db.set_dispatch_mark(id, "duplicate")?;
+        self.emit(AppEvent::IssuesChanged);
+        Ok(out)
+    }
+
+    /// 设置里“团队分工”的候选：我管理的项目的成员，带按历史推断的分工和负载
+    pub async fn dispatch_team(self: &Arc<Self>) -> Result<Vec<TeamCandidate>> {
+        let projects = self.dispatch_projects().await?;
+        let ids: Vec<u64> = projects.iter().map(|p| p.0).collect();
+        let ctxs = self.assign_ctxs_for(&ids).await;
+        let me = self.me().await.ok().map(|u| u.id);
+        let mut out: Vec<TeamCandidate> = Vec::new();
+        for (pid, pname) in &projects {
+            let Some(Ok(ctx)) = ctxs.get(pid) else { continue };
+            for m in project::candidates(&ctx.members) {
+                if Some(m.id) == me {
+                    continue;
+                }
+                let load = ctx.load.get(&m.id).copied().unwrap_or(0);
+                let guess = project::role_from_names(&m.roles)
+                    .map(|r| (r.to_string(), format!("Redmine 角色：{}", m.roles.join("、"))))
+                    .or_else(|| ctx.guessed.get(&m.id).cloned());
+                match out.iter_mut().find(|x| x.id == m.id) {
+                    Some(x) => {
+                        x.projects.push(pname.clone());
+                        x.load += load;
+                        if x.guessed_role.is_empty() {
+                            if let Some((r, why)) = guess {
+                                x.guessed_role = r;
+                                x.guess_reason = why;
+                            }
+                        }
+                    }
+                    None => {
+                        let (guessed_role, guess_reason) = guess.unwrap_or_default();
+                        out.push(TeamCandidate { id: m.id, name: m.name.clone(), projects: vec![pname.clone()], load, guessed_role, guess_reason });
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| b.load.cmp(&a.load).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
     }
 
@@ -1767,6 +2496,7 @@ impl Service {
             ai_cost_30d: (prompt_tokens as f64 * ai.price_input + completion_tokens as f64 * ai.price_output) / 1_000_000.0,
             ai_currency: ai.currency,
             last_sync_at: self.db.kv_get("last_sync_at")?,
+            dispatch_pending: self.queue_views().map(|v| v.len()).unwrap_or(0),
         })
     }
 
@@ -1807,19 +2537,19 @@ impl Service {
 
 // ---------------- 工具函数 ----------------
 
-/// 给 AI 的成员说明：角色、当前负载、正在负责的任务（体现熟悉的模块）
-fn members_brief(cands: &[&Assignee], ov: &ProjectOverview, load: &HashMap<u64, usize>) -> String {
+/// 给 AI 的成员说明：角色、分工、当前负载、正在负责的任务（体现熟悉的模块）
+fn members_brief(cands: &[&Assignee], open: &[ProjectIssue], load: &HashMap<u64, usize>, roles: &HashMap<u64, String>) -> String {
     let mut body = String::from("项目成员：\n");
     for c in cands {
-        let own: Vec<String> = ov
-            .issues
+        let own: Vec<String> = open
             .iter()
             .filter(|i| i.assignee_id == Some(c.id))
             .take(6)
             .map(|i| format!("#{} {}", i.id, truncate(&i.subject, 30)))
             .collect();
+        let role = roles.get(&c.id).map(|r| format!("，分工：{r}")).unwrap_or_default();
         body.push_str(&format!(
-            "- [{}] {}（{}）当前未关闭 {} 个；正在负责：{}\n",
+            "- [{}] {}（{}{role}）当前未关闭 {} 个；正在负责：{}\n",
             c.id,
             c.name,
             if c.roles.is_empty() { "角色未知".into() } else { c.roles.join("、") },
@@ -1828,6 +2558,125 @@ fn members_brief(cands: &[&Assignee], ov: &ProjectOverview, load: &HashMap<u64, 
         ));
     }
     body
+}
+
+/// 推荐负责人用到的项目数据
+#[derive(Clone, Default)]
+struct AssignCtx {
+    members: Vec<Assignee>,
+    categories: Vec<IssueCategory>,
+    /// 项目全部未关闭任务
+    open: Vec<ProjectIssue>,
+    /// 参考任务：未关闭的，以及近期关闭且没有回派给提出人的
+    refs: Vec<ProjectIssue>,
+    /// 成员 ID → 当前负责的未关闭任务数
+    load: HashMap<u64, usize>,
+    /// 按历史推断的分工：成员 ID → (方向, 依据)
+    guessed: HashMap<u64, (String, String)>,
+    /// 有未关闭子任务的任务（已经拆分过，不再进入分派台）
+    parents: HashSet<u64>,
+}
+
+/// 保存在本地的 AI 派单建议
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiDispatch {
+    assignee_id: u64,
+    reason: String,
+    #[serde(default)]
+    parts: Vec<AiPart>,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiPart {
+    role: String,
+    assignee_id: u64,
+    subject: String,
+    description: String,
+    reason: String,
+}
+
+/// 没有权限查看成员时，用任务的负责人作为候选
+fn members_from_issues(issues: &[ProjectIssue]) -> Vec<Assignee> {
+    let mut members: Vec<Assignee> = Vec::new();
+    for i in issues {
+        if let Some(id) = i.assignee_id {
+            if !members.iter().any(|m| m.id == id) {
+                members.push(Assignee { id, name: i.assignee.clone(), is_group: false, roles: vec![] });
+            }
+        }
+    }
+    members
+}
+
+/// 成员分工：设置里标注的 > Redmine 角色名里带的 > 按历史推断的。返回 成员 ID → (方向, 是否推断)
+fn member_roles(members: &[Assignee], team: &[TeamMember], guessed: &HashMap<u64, (String, String)>) -> HashMap<u64, (String, bool)> {
+    let mut out = HashMap::new();
+    for m in members.iter().filter(|m| !m.is_group) {
+        if let Some(t) = team.iter().find(|t| t.id == m.id && !t.role.trim().is_empty()) {
+            out.insert(m.id, (t.role.trim().to_string(), false));
+        } else if let Some(r) = project::role_from_names(&m.roles) {
+            out.insert(m.id, (r.to_string(), false));
+        } else if let Some((r, _)) = guessed.get(&m.id) {
+            out.insert(m.id, (r.clone(), true));
+        }
+    }
+    out
+}
+
+/// 分派时可选的成员：设置里的常用成员按顺序在前，其余按最近派单次数、姓名排序；前 9 个（不含自己）有数字键。组排在最后。
+fn dispatch_members(
+    ctx: &AssignCtx,
+    roles: &HashMap<u64, (String, bool)>,
+    team: &[TeamMember],
+    me: Option<u64>,
+    counts: &HashMap<u64, usize>,
+) -> Vec<DispatchMember> {
+    let mut users: Vec<&Assignee> = project::candidates(&ctx.members);
+    users.sort_by(|a, b| {
+        let ta = team.iter().position(|t| t.id == a.id).unwrap_or(usize::MAX);
+        let tb = team.iter().position(|t| t.id == b.id).unwrap_or(usize::MAX);
+        let me_last = (Some(a.id) == me).cmp(&(Some(b.id) == me));
+        me_last
+            .then(ta.cmp(&tb))
+            .then_with(|| counts.get(&b.id).unwrap_or(&0).cmp(counts.get(&a.id).unwrap_or(&0)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut key = 0u8;
+    let mut out: Vec<DispatchMember> = users
+        .into_iter()
+        .map(|m| {
+            let k = if Some(m.id) != me && key < 9 {
+                key += 1;
+                Some(key)
+            } else {
+                None
+            };
+            let (role, guessed) = roles.get(&m.id).cloned().unwrap_or_default();
+            DispatchMember {
+                id: m.id,
+                name: m.name.clone(),
+                is_group: false,
+                roles: m.roles.clone(),
+                load: ctx.load.get(&m.id).copied().unwrap_or(0),
+                role,
+                role_guessed: guessed,
+                key: k,
+            }
+        })
+        .collect();
+    out.extend(ctx.members.iter().filter(|m| m.is_group).map(|m| DispatchMember {
+        id: m.id,
+        name: m.name.clone(),
+        is_group: true,
+        roles: m.roles.clone(),
+        load: ctx.load.get(&m.id).copied().unwrap_or(0),
+        role: String::new(),
+        role_guessed: false,
+        key: None,
+    }));
+    out
 }
 
 /// 给用户看的错误信息，不带错误码
@@ -1865,6 +2714,8 @@ struct UpdatePlan {
     done_ratio: Option<u32>,
     private_notes: bool,
     files: Vec<PathBuf>,
+    due_date: Option<String>,
+    category_id: Option<u64>,
 }
 
 fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -2094,6 +2945,8 @@ fn view_from_issue(is: &Issue) -> IssueView {
         due_date: is.due_date.clone(),
         created_on: is.created_on.clone(),
         updated_on: is.updated_on.clone(),
+        redmine_category_id: is.category.as_ref().map(|c| c.id),
+        redmine_category: is.category.as_ref().map(|c| c.name.clone()),
         ..Default::default()
     }
 }

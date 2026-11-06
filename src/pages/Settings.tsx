@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import clsx from "clsx";
-import { Bot, CheckCircle2, Copy, KeyRound, Plug, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Tags, Trash2, Workflow } from "lucide-react";
-import { api, errorText, type AppConfig, type NamedId } from "../lib/api";
+import { ArrowDown, ArrowUp, Bot, CheckCircle2, Copy, KeyRound, Plug, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Tags, Trash2, Users, Workflow, X } from "lucide-react";
+import { api, errorText, type AppConfig, type NamedId, type ProjectAccess, type TeamCandidate, type TeamMember } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { isMac } from "../lib/format";
@@ -21,6 +21,7 @@ const SECTIONS = [
   { id: "sync", label: "同步与提醒", icon: RefreshCw },
   { id: "workflow", label: "工作流", icon: Workflow },
   { id: "ai", label: "AI 模型", icon: Bot },
+  { id: "dispatch", label: "分派", icon: Users },
   { id: "mcp", label: "MCP 服务", icon: Plug },
   { id: "rules", label: "分类规则", icon: Tags },
 ] as const;
@@ -36,6 +37,7 @@ export function SettingsPage() {
   const [statuses, setStatuses] = useState<NamedId[]>([]);
   const [activities, setActivities] = useState<NamedId[]>([]);
   const [projects, setProjects] = useState<{ id: number; name: string }[]>([]);
+  const [myProjects, setMyProjects] = useState<ProjectAccess[]>([]);
   const [clientTab, setClientTab] = useState<"claude" | "http" | "stdio">("claude");
   const [autostart, setAutostart] = useState<boolean | null>(null);
 
@@ -69,6 +71,7 @@ export function SettingsPage() {
     if (!secrets.redmine) return;
     api.statuses().then(setStatuses).catch(() => {});
     api.activities().then(setActivities).catch(() => {});
+    api.myProjects().then(setMyProjects).catch(() => {});
     api
       .listIssues({ includeDone: true })
       .then((xs) => {
@@ -281,7 +284,7 @@ export function SettingsPage() {
                 onChange={(v) => set("sync", { notifyChanges: v })}
               />
               <Toggle label="到期提醒" desc="任务今天或明天到期时提醒，每个任务每天最多一次" checked={draft.sync.notifyDue} onChange={(v) => set("sync", { notifyDue: v })} />
-              <Toggle label="新任务自动 AI 分析" desc="同步到新任务或任务有更新时，自动调用 AI 做分类与摘要" checked={draft.sync.autoAnalyze} onChange={(v) => set("sync", { autoAnalyze: v })} />
+              <Toggle label="新任务自动 AI 分析" desc="同步到新任务或任务有更新时，自动调用 AI 做分类与摘要；进入分派台的新任务同时给出派单建议" checked={draft.sync.autoAnalyze} onChange={(v) => set("sync", { autoAnalyze: v })} />
             </Section>
 
             {/* 工作流 */}
@@ -488,6 +491,77 @@ export function SettingsPage() {
               </div>
             </Section>
 
+            {/* 分派 */}
+            <Section
+              id="dispatch"
+              title="分派"
+              desc="开发经理把收到的问题派给团队成员。分派台收录指派给你的新问题，以及你管理的项目里没人负责的问题。"
+            >
+              <Toggle
+                label="同步我管理的项目里未指派的任务"
+                desc="在你担任管理角色（项目经理、负责人等）的项目里，没人负责的任务也会进入收件箱和分派台"
+                checked={draft.sync.managedUnassigned}
+                onChange={(v) => set("sync", { managedUnassigned: v })}
+              />
+              <Field label="待分派的状态" hint="指派给你、处于这些状态的任务进入分派台；都不选时自动识别「新建」一类的状态">
+                <ChipPicker
+                  options={statuses.filter((s) => !s.isClosed).map((s) => ({ id: s.id, name: s.name }))}
+                  value={draft.dispatch.pendingStatusIds}
+                  onChange={(v) => set("dispatch", { pendingStatusIds: v })}
+                  empty="（先连接 Redmine）"
+                />
+              </Field>
+              <Field label="拉取未指派任务的项目" hint="都不选时为你担任管理角色的项目">
+                <ChipPicker
+                  options={myProjects.map((p) => ({ id: p.id, name: p.name, hint: p.isManager ? "管理" : undefined }))}
+                  value={draft.dispatch.projectIds}
+                  onChange={(v) => set("dispatch", { projectIds: v })}
+                  empty="（先连接 Redmine）"
+                />
+              </Field>
+              <Field label="默认截止期限" hint="任务没有截止日期时，派单栏按优先级预填截止日期（工作日，跳过周末）；0 表示不预填">
+                <div className="grid grid-cols-4 gap-3">
+                  {(
+                    [
+                      ["urgent", "紧急 / 立刻"],
+                      ["high", "高"],
+                      ["normal", "普通"],
+                      ["low", "低"],
+                    ] as const
+                  ).map(([k, label]) => (
+                    <label key={k} className="flex items-center gap-2 text-[12.5px] text-ink-2">
+                      <span className="shrink-0">{label}</span>
+                      <div className="w-14">
+                        <Input
+                          type="number"
+                          min={0}
+                          max={60}
+                          value={draft.dispatch.dueDays[k]}
+                          onChange={(e) => set("dispatch", { dueDays: { ...draft.dispatch.dueDays, [k]: Math.max(0, Number(e.target.value) || 0) } })}
+                          className="h-7"
+                        />
+                      </div>
+                      <span>天</span>
+                    </label>
+                  ))}
+                </div>
+              </Field>
+              <div className="grid grid-cols-2 gap-4">
+                <Field label="派单后的状态" hint="例如「已指派」；不设置时保持原状态">
+                  {statusSelect(draft.dispatch.assignedStatusId, (v) => set("dispatch", { assignedStatusId: v }))}
+                </Field>
+                <Field label="派单备注模板（可选）" hint="可用 {负责人} {提出人} {截止日期}，派单时预填，可以修改">
+                  <Input
+                    value={draft.dispatch.noteTemplate}
+                    onChange={(e) => set("dispatch", { noteTemplate: e.target.value })}
+                    placeholder="请在 {截止日期} 前处理，有问题直接联系提出人 {提出人}"
+                  />
+                </Field>
+              </div>
+              <Toggle label="派单时把我加为关注人" desc="派出去以后，进度更新和退回都能收到通知（需要有「添加关注者」权限）" checked={draft.dispatch.watch} onChange={(v) => set("dispatch", { watch: v })} />
+              <TeamEditor team={draft.dispatch.team} onChange={(team) => set("dispatch", { team })} />
+            </Section>
+
             {/* 分类规则 */}
             <Section
               id="rules"
@@ -531,6 +605,138 @@ export function SettingsPage() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+const ROLES = ["前端", "后端", "全栈", "测试", "运维", "数据", "产品"];
+
+/** 多选标签：点击切换 */
+function ChipPicker({ options, value, onChange, empty }: { options: { id: number; name: string; hint?: string }[]; value: number[]; onChange: (v: number[]) => void; empty: string }) {
+  if (options.length === 0) return <div className="text-[12.5px] text-ink-3">{empty}</div>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {options.map((o) => {
+        const on = value.includes(o.id);
+        return (
+          <button
+            key={o.id}
+            type="button"
+            onClick={() => onChange(on ? value.filter((x) => x !== o.id) : [...value, o.id])}
+            className={clsx(
+              "inline-flex h-7 items-center gap-1 rounded-full border px-2.5 text-[12.5px]",
+              on ? "border-accent/50 bg-accent-soft text-accent-ink" : "border-line bg-panel text-ink-2 hover:bg-hover",
+            )}
+          >
+            {on && <CheckCircle2 className="size-3" />}
+            {o.name}
+            {o.hint && <span className="text-[11px] text-ink-3">{o.hint}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** 团队分工与常用成员：顺序就是分派台数字键的顺序 */
+function TeamEditor({ team, onChange }: { team: TeamMember[]; onChange: (t: TeamMember[]) => void }) {
+  const toast = useToast();
+  const [cands, setCands] = useState<TeamCandidate[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function loadTeam() {
+    setLoading(true);
+    try {
+      setCands(await api.dispatchTeam());
+    } catch (e) {
+      toast.show({ tone: "error", title: "读取项目成员失败", body: errorText(e) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const rest = (cands ?? []).filter((c) => !team.some((t) => t.id === c.id));
+  const guessOf = (id: number) => cands?.find((c) => c.id === id);
+  const move = (i: number, d: number) => {
+    const j = i + d;
+    if (j < 0 || j >= team.length) return;
+    const t = [...team];
+    [t[i], t[j]] = [t[j], t[i]];
+    onChange(t);
+  };
+
+  return (
+    <div className="rounded-xl border border-line">
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2">
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-medium text-ink">团队分工与常用成员</div>
+          <div className="text-[11.5px] text-ink-3">分工用于推荐人选和判断是否需要前端、后端一起做；前 9 位对应分派台的数字键。没有标注的成员按历史推断分工。</div>
+        </div>
+        <Button size="sm" icon={<RefreshCw className="size-3" />} loading={loading} onClick={() => void loadTeam()}>
+          {cands ? "重新读取" : "读取项目成员"}
+        </Button>
+      </div>
+      {team.length === 0 && !cands && <div className="px-3 py-3 text-[12.5px] text-ink-3">还没有设置。点「读取项目成员」，按历史推断的分工添加进来，再按需调整。</div>}
+      {team.length > 0 && (
+        <ul className="divide-y divide-line">
+          {team.map((t, i) => {
+            const g = guessOf(t.id);
+            return (
+              <li key={t.id} className="flex items-center gap-2 px-3 py-1.5 text-[12.5px]">
+                <span className="w-5 text-center text-ink-3 tabular-nums">{i < 9 ? i + 1 : ""}</span>
+                <span className="w-24 truncate font-medium text-ink">{t.name}</span>
+                <div className="w-28">
+                  <Select value={t.role} onChange={(e) => onChange(team.map((x) => (x.id === t.id ? { ...x, role: e.target.value } : x)))} className="h-7 text-[12.5px]">
+                    <option value="">未设置</option>
+                    {ROLES.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <span className="min-w-0 flex-1 truncate text-[11.5px] text-ink-3" title={g?.guessReason}>
+                  {g ? `${g.projects.join("、")} · 当前 ${g.load} 个${g.guessedRole && g.guessedRole !== t.role ? ` · 推断为${g.guessedRole}` : ""}` : ""}
+                </span>
+                <button className="rounded p-1 text-ink-3 hover:bg-hover disabled:opacity-30" disabled={i === 0} title="上移" onClick={() => move(i, -1)}>
+                  <ArrowUp className="size-3.5" />
+                </button>
+                <button className="rounded p-1 text-ink-3 hover:bg-hover disabled:opacity-30" disabled={i === team.length - 1} title="下移" onClick={() => move(i, 1)}>
+                  <ArrowDown className="size-3.5" />
+                </button>
+                <button className="rounded p-1 text-ink-3 hover:bg-hover hover:text-accent" title="移除" onClick={() => onChange(team.filter((x) => x.id !== t.id))}>
+                  <X className="size-3.5" />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {cands && (
+        <div className="border-t border-line bg-sunken/40 px-3 py-2">
+          <div className="mb-1.5 flex items-center gap-2 text-[12px] text-ink-3">
+            <span className="flex-1">{rest.length ? `项目里还有 ${rest.length} 位成员` : "项目成员都已添加"}</span>
+            {rest.length > 0 && (
+              <Button size="sm" variant="ghost" icon={<Plus className="size-3" />} onClick={() => onChange([...team, ...rest.map((c) => ({ id: c.id, name: c.name, role: c.guessedRole }))])}>
+                全部添加
+              </Button>
+            )}
+          </div>
+          <ul className="space-y-1">
+            {rest.map((c) => (
+              <li key={c.id} className="flex items-center gap-2 text-[12.5px]">
+                <span className="w-24 truncate font-medium text-ink">{c.name}</span>
+                <span className="min-w-0 flex-1 truncate text-[11.5px] text-ink-3" title={c.guessReason}>
+                  {c.guessedRole ? `推断为${c.guessedRole}（${c.guessReason}）` : "分工未知"} · {c.projects.join("、")} · 当前 {c.load} 个
+                </span>
+                <Button size="sm" variant="ghost" icon={<Plus className="size-3" />} onClick={() => onChange([...team, { id: c.id, name: c.name, role: c.guessedRole }])}>
+                  添加
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }
