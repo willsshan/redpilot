@@ -282,6 +282,8 @@ pub struct BulkAssignItem {
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 #[serde(default)]
 pub struct DispatchQueueParams {
+    /// 只看某个项目的待分派任务（项目 ID，可用 list_my_projects 查询）
+    pub project_id: Option<u64>,
     /// 先让 RedPilot 配置的 AI 结合成员分工、正在负责的任务和负载给出建议（默认 false：用本地算法）
     pub use_ai: bool,
 }
@@ -635,14 +637,21 @@ impl RedPilotMcp {
         to_json(&self.svc.bulk_assign(&items, p.notes).await)
     }
 
-    #[tool(description = "分派台（开发经理视角）：等待我分派的任务（指派给我且处于“新建”一类状态的，以及我管理的项目里未指派的），每个任务给出推荐的负责人和理由；需要多人分工（如前端+后端）时给出 multi 方案。同时返回各项目可选成员的分工方向和负载。只给建议，不修改 Redmine。")]
+    #[tool(description = "分派台（开发经理视角）：等待我分派的任务（指派给我且处于“新建”一类状态的，以及我管理的项目里未指派的），可用 project_id 只看某个项目；每个任务给出推荐的负责人和理由；需要多人分工（如前端+后端）时给出 multi 方案。同时返回各项目可选成员的分工方向和负载。只给建议，不修改 Redmine。")]
     async fn get_dispatch_queue(&self, Parameters(p): Parameters<DispatchQueueParams>) -> ToolResult {
         self.prepare();
-        let mut q = self.svc.dispatch_queue().await.map_err(err)?;
+        let only = |mut q: DispatchQueue| {
+            if let Some(pid) = p.project_id {
+                q.items.retain(|i| i.issue.project_id == pid);
+                q.projects.retain(|x| x.id == pid);
+            }
+            q
+        };
+        let mut q = only(self.svc.dispatch_queue().await.map_err(err)?);
         if p.use_ai && !q.items.is_empty() {
             let ids: Vec<u64> = q.items.iter().map(|i| i.issue.id).collect();
             self.svc.ai_dispatch(&ids).await.map_err(err)?;
-            q = self.svc.dispatch_queue().await.map_err(err)?;
+            q = only(self.svc.dispatch_queue().await.map_err(err)?);
         }
         to_json(&dispatch_brief(&q, &self.base_url()))
     }

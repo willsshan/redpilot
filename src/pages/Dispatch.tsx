@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import clsx from "clsx";
-import { Check, Copy, Forward, GitFork, PlugZap, RefreshCw, Settings2, Sparkles, X } from "lucide-react";
+import { Check, ChevronRight, Copy, Forward, GitFork, PlugZap, RefreshCw, Settings2, Sparkles, X } from "lucide-react";
 import {
   api,
   errorText,
@@ -21,6 +21,25 @@ import { FollowUpDialog } from "../components/ResolveDialog";
 import { SplitDialog } from "../components/SplitDialog";
 import { DispatchPanel, outcomeToast, recommendedRequest } from "../components/DispatchPanel";
 
+const PROJECT_KEY = "rp.dispatch.project";
+
+/** 记住的项目筛选（null 表示全部项目） */
+function storedProject(): number | null {
+  try {
+    const v = Number(localStorage.getItem(PROJECT_KEY));
+    return Number.isInteger(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+interface ProjectGroup {
+  id: number | null;
+  /** 按项目分组时的项目名，不分组时为空 */
+  title: string | null;
+  items: DispatchItem[];
+}
+
 /** 分派台：开发经理把收到的问题快速派给团队成员 */
 export function DispatchPage() {
   const { rev, config, secrets, setPage, dispatch: go, syncing, sync } = useApp();
@@ -39,7 +58,19 @@ export function DispatchPage() {
   const [custom, setCustom] = useState<{ id: number; parts: SplitPart[] } | null>(null);
   const [dupFor, setDupFor] = useState<number | null>(null);
   const [aiBusy, setAiBusy] = useState<"all" | number | null>(null);
+  const [project, setProjectState] = useState<number | null>(storedProject);
   const loadSeq = useRef(0);
+
+  const setProject = useCallback((id: number | null) => {
+    setProjectState(id);
+    setChecked(new Set());
+    try {
+      if (id === null) localStorage.removeItem(PROJECT_KEY);
+      else localStorage.setItem(PROJECT_KEY, String(id));
+    } catch {
+      // 无法写入时只影响记住筛选
+    }
+  }, []);
 
   const configured = !!config?.redmine.baseUrl && secrets.redmine;
 
@@ -64,7 +95,26 @@ export function DispatchPage() {
     if (configured) void load();
   }, [load, rev, configured]);
 
-  const items = useMemo(() => (queue?.items ?? []).filter((i) => !hidden.has(i.issue.id)), [queue, hidden]);
+  const all = useMemo(() => (queue?.items ?? []).filter((i) => !hidden.has(i.issue.id)), [queue, hidden]);
+  // 各项目的待分派数，多的在前
+  const projectCounts = useMemo(() => {
+    const m = new Map<number, { id: number; name: string; count: number }>();
+    for (const i of all) {
+      const p = m.get(i.issue.projectId) ?? { id: i.issue.projectId, name: i.issue.projectName, count: 0 };
+      p.count += 1;
+      m.set(p.id, p);
+    }
+    return [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "zh-CN"));
+  }, [all]);
+  // 选了项目只看这个项目；全部项目时按项目分组（只有一个项目时不分组）
+  const groups: ProjectGroup[] = useMemo(() => {
+    if (project !== null) return [{ id: project, title: null, items: all.filter((i) => i.issue.projectId === project) }];
+    if (projectCounts.length <= 1) return [{ id: null, title: null, items: all }];
+    return projectCounts.map((p) => ({ id: p.id, title: p.name, items: all.filter((i) => i.issue.projectId === p.id) }));
+  }, [all, project, projectCounts]);
+  // 列表中实际显示的顺序，切换、批量派单和 AI 推荐都只针对这些任务
+  const items = useMemo(() => groups.flatMap((g) => g.items), [groups]);
+  const projectName = project === null ? null : (queue?.projects.find((p) => p.id === project)?.name ?? projectCounts.find((p) => p.id === project)?.name ?? `项目 #${project}`);
   const projectOf = (pid: number) => queue?.projects.find((p) => p.id === pid);
   const current = items.find((i) => i.issue.id === selected) ?? null;
 
@@ -218,6 +268,12 @@ export function DispatchPage() {
           else n.add(current.issue.id);
           return n;
         });
+      } else if ((e.key === "[" || e.key === "]") && projectCounts.length > 0) {
+        // 在“全部项目”和各项目之间切换
+        e.preventDefault();
+        const order: (number | null)[] = [null, ...projectCounts.map((p) => p.id)];
+        const at = Math.max(0, order.indexOf(project));
+        setProject(order[(at + (e.key === "]" ? 1 : -1) + order.length) % order.length]);
       } else if (e.key === "Escape") {
         setChecked(new Set());
       } else if (e.key === "Enter" && e.shiftKey) {
@@ -259,7 +315,7 @@ export function DispatchPage() {
     <div className="flex h-full min-w-0 flex-col">
       <header data-tauri-drag-region className={clsx("flex shrink-0 items-center gap-3 border-b border-line px-5", isMac ? "h-[52px]" : "h-12")}>
         <h2 data-tauri-drag-region className="text-[15px] font-semibold">
-          分派台 <span className="ml-1 font-normal text-ink-3 tabular-nums">{queue ? items.length : ""}</span>
+          分派台 <span className="ml-1 font-normal text-ink-3 tabular-nums">{queue ? all.length : ""}</span>
         </h2>
         <span data-tauri-drag-region className="truncate text-[12px] text-ink-3" title={scopeText}>
           {scopeText}
@@ -294,7 +350,7 @@ export function DispatchPage() {
             </div>
           ) : loadError && !queue ? (
             <Empty icon={<X className="size-6" />} title="无法读取分派台" desc={loadError} action={<Button onClick={() => void load()}>重试</Button>} />
-          ) : items.length === 0 ? (
+          ) : all.length === 0 ? (
             <Empty
               icon={<Check className="size-6" />}
               title="没有待分派的任务"
@@ -303,31 +359,85 @@ export function DispatchPage() {
             />
           ) : (
             <>
-              <div className="sticky top-0 z-[2] flex items-center gap-2 border-b border-line bg-canvas/95 px-4 py-1.5 text-[12px] text-ink-3 backdrop-blur">
-                <span className="tabular-nums">{items.length} 个待分派</span>
-                <span className="ml-auto">
-                  <Kbd>J</Kbd> <Kbd>K</Kbd> 切换 · <Kbd>X</Kbd> 多选 · <Kbd>⇧↵</Kbd> 按推荐全部派出
-                </span>
+              <div className="sticky top-0 z-[3] border-b border-line bg-canvas/95 backdrop-blur">
+                {(projectCounts.length > 1 || project !== null) && (
+                  <div className="flex items-center gap-1.5 overflow-x-auto px-3 pt-2 pb-1.5">
+                    <ProjectChip active={project === null} onClick={() => setProject(null)}>
+                      全部项目 <span className="text-ink-3">{all.length}</span>
+                    </ProjectChip>
+                    {projectCounts.map((p) => (
+                      <ProjectChip key={p.id} active={project === p.id} onClick={() => setProject(project === p.id ? null : p.id)}>
+                        <span className="max-w-[140px] truncate">{p.name}</span> <span className="text-ink-3">{p.count}</span>
+                      </ProjectChip>
+                    ))}
+                    {project !== null && !projectCounts.some((p) => p.id === project) && (
+                      <ProjectChip active onClick={() => setProject(null)}>
+                        <span className="max-w-[140px] truncate">{projectName}</span> <span className="text-ink-3">0</span>
+                      </ProjectChip>
+                    )}
+                  </div>
+                )}
+                <div className="flex items-center gap-2 px-4 py-1.5 text-[12px] whitespace-nowrap text-ink-3">
+                  <span className="min-w-0 truncate tabular-nums">
+                    {project !== null ? `${projectName} · ` : ""}
+                    {items.length} 个待分派
+                  </span>
+                  <span className="ml-auto" title="J / K 上下切换">
+                    <Kbd>X</Kbd> 多选 · <Kbd>⇧↵</Kbd> 全部派出
+                    {projectCounts.length > 1 && (
+                      <>
+                        {" "}· <Kbd>[</Kbd>
+                        <Kbd>]</Kbd> 换项目
+                      </>
+                    )}
+                  </span>
+                </div>
               </div>
-              <ul className="divide-y divide-line/70">
-                {items.map((i) => (
-                  <QueueRow
-                    key={i.issue.id}
-                    item={i}
-                    active={i.issue.id === selected}
-                    checked={checked.has(i.issue.id)}
-                    onClick={() => setSelected(i.issue.id)}
-                    onCheck={() =>
-                      setChecked((s) => {
-                        const n = new Set(s);
-                        if (n.has(i.issue.id)) n.delete(i.issue.id);
-                        else n.add(i.issue.id);
-                        return n;
-                      })
-                    }
-                  />
-                ))}
-              </ul>
+              {items.length === 0 ? (
+                <Empty
+                  icon={<Check className="size-6" />}
+                  title={`「${projectName}」已全部分派完`}
+                  desc={`其他项目还有 ${all.length} 个待分派`}
+                  action={<Button onClick={() => setProject(null)}>查看全部项目</Button>}
+                />
+              ) : (
+                groups.map((g) => (
+                  <section key={g.id ?? "all"}>
+                    {g.title && (
+                      <button
+                        onClick={() => g.id !== null && setProject(g.id)}
+                        title="只看这个项目"
+                        className="group/h sticky top-[73px] z-[2] flex w-full items-center gap-1.5 border-b border-line/70 bg-sunken/95 px-4 py-1.5 text-left text-[12px] font-semibold text-ink-2 backdrop-blur hover:text-ink"
+                      >
+                        <span className="truncate">{g.title}</span>
+                        <span className="font-normal text-ink-3 tabular-nums">{g.items.length}</span>
+                        <span className="ml-auto flex items-center gap-0.5 font-normal text-ink-3 opacity-0 group-hover/h:opacity-100">
+                          只看这个项目 <ChevronRight className="size-3" />
+                        </span>
+                      </button>
+                    )}
+                    <ul className="divide-y divide-line/70">
+                      {g.items.map((i) => (
+                        <QueueRow
+                          key={i.issue.id}
+                          item={i}
+                          active={i.issue.id === selected}
+                          checked={checked.has(i.issue.id)}
+                          onClick={() => setSelected(i.issue.id)}
+                          onCheck={() =>
+                            setChecked((s) => {
+                              const n = new Set(s);
+                              if (n.has(i.issue.id)) n.delete(i.issue.id);
+                              else n.add(i.issue.id);
+                              return n;
+                            })
+                          }
+                        />
+                      ))}
+                    </ul>
+                  </section>
+                ))
+              )}
             </>
           )}
 
@@ -398,7 +508,7 @@ export function DispatchPage() {
               }
             />
           ) : (
-            queue && <Empty icon={<Forward className="size-6" />} title="选择一个任务开始分派" desc="数字键直接派给对应成员，⇧+数字可以同时选前端和后端" />
+            queue && all.length > 0 && <Empty icon={<Forward className="size-6" />} title="选择一个任务开始分派" desc="数字键直接派给对应成员，⇧+数字可以同时选前端和后端" />
           )}
         </div>
       </div>
@@ -440,6 +550,20 @@ export function DispatchPage() {
   );
 }
 
+function ProjectChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        "inline-flex h-7 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[12.5px] transition-colors",
+        active ? "border-ink/80 bg-ink text-canvas [&_.text-ink-3]:text-canvas/60" : "border-line bg-panel text-ink-2 hover:bg-hover",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
 function QueueRow({ item, active, checked, onClick, onCheck }: { item: DispatchItem; active: boolean; checked: boolean; onClick: () => void; onCheck: () => void }) {
   const i = item.issue;
   const a = i.analysis;
@@ -471,7 +595,6 @@ function QueueRow({ item, active, checked, onClick, onCheck }: { item: DispatchI
         <div className="flex items-center gap-1.5 text-[11.5px] text-ink-3">
           {i.unread && <span className="size-1.5 rounded-full bg-accent" />}
           <span className="font-mono">#{i.id}</span>
-          <span className="truncate">· {i.projectName}</span>
           {!i.assignedToId && <span className="shrink-0 text-warn">· 未指派</span>}
           <span className="ml-auto shrink-0" title={`提出于 ${dateTime(i.createdOn)}`}>
             {relativeTime(i.createdOn)}
