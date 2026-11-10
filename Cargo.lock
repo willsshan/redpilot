@@ -3425,7 +3425,7 @@ dependencies = [
 
 [[package]]
 name = "redpilot"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "percent-encoding",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "redpilot-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",

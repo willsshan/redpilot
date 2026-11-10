@@ -1,7 +1,7 @@
 {
   "name": "redpilot",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": "jayton",
   "license": "MIT",
   "type": "module",
