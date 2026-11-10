@@ -1984,8 +1984,8 @@ impl Service {
         let cfg = self.config();
         let me = read(&self.me).map(|u| u.id);
         let today = chrono::Local::now().date_naive();
-        // 优先级高的在前，同优先级先来的在前
-        views.sort_by(|a, b| b.priority_id.cmp(&a.priority_id).then_with(|| a.created_on.cmp(&b.created_on)).then(a.id.cmp(&b.id)));
+        // 新提出的在前
+        views.sort_by(|a, b| b.created_on.cmp(&a.created_on).then(b.id.cmp(&a.id)));
         let mut pids: Vec<(u64, String)> = Vec::new();
         for v in &views {
             if !pids.iter().any(|p| p.0 == v.project_id) {

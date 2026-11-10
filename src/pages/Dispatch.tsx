@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { Check, ChevronRight, Copy, Forward, GitFork, PlugZap, RefreshCw, Settings2, Sparkles, X } from "lucide-react";
 import {
@@ -359,39 +359,34 @@ export function DispatchPage() {
             />
           ) : (
             <>
-              <div className="sticky top-0 z-[3] border-b border-line bg-canvas/95 backdrop-blur">
-                {(projectCounts.length > 1 || project !== null) && (
-                  <div className="flex items-center gap-1.5 overflow-x-auto px-3 pt-2 pb-1.5">
-                    <ProjectChip active={project === null} onClick={() => setProject(null)}>
-                      全部项目 <span className="text-ink-3">{all.length}</span>
-                    </ProjectChip>
-                    {projectCounts.map((p) => (
-                      <ProjectChip key={p.id} active={project === p.id} onClick={() => setProject(project === p.id ? null : p.id)}>
-                        <span className="max-w-[140px] truncate">{p.name}</span> <span className="text-ink-3">{p.count}</span>
-                      </ProjectChip>
-                    ))}
-                    {project !== null && !projectCounts.some((p) => p.id === project) && (
-                      <ProjectChip active onClick={() => setProject(null)}>
-                        <span className="max-w-[140px] truncate">{projectName}</span> <span className="text-ink-3">0</span>
-                      </ProjectChip>
-                    )}
+              <div className="sticky top-0 z-[3] flex h-11 items-center gap-2 border-b border-line bg-canvas/95 px-3 text-[12px] whitespace-nowrap text-ink-3 backdrop-blur">
+                {projectCounts.length > 1 || project !== null ? (
+                  <div className="min-w-0 flex-1">
+                    <Select
+                      value={project ?? ""}
+                      onChange={(e) => {
+                        setProject(e.target.value ? Number(e.target.value) : null);
+                        // 选完交还焦点，J/K 和数字键可以直接用
+                        e.currentTarget.blur();
+                      }}
+                      className="h-7 max-w-full truncate text-[12.5px]"
+                      title={projectCounts.length > 1 ? "按 [ 和 ] 也可以切换项目" : undefined}
+                    >
+                      <option value="">全部项目（{all.length}）</option>
+                      {projectCounts.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}（{p.count}）
+                        </option>
+                      ))}
+                      {project !== null && !projectCounts.some((p) => p.id === project) && <option value={project}>{projectName}（0）</option>}
+                    </Select>
                   </div>
+                ) : (
+                  <span className="min-w-0 flex-1 truncate pl-1 tabular-nums">{items.length} 个待分派</span>
                 )}
-                <div className="flex items-center gap-2 px-4 py-1.5 text-[12px] whitespace-nowrap text-ink-3">
-                  <span className="min-w-0 truncate tabular-nums">
-                    {project !== null ? `${projectName} · ` : ""}
-                    {items.length} 个待分派
-                  </span>
-                  <span className="ml-auto" title="J / K 上下切换">
-                    <Kbd>X</Kbd> 多选 · <Kbd>⇧↵</Kbd> 全部派出
-                    {projectCounts.length > 1 && (
-                      <>
-                        {" "}· <Kbd>[</Kbd>
-                        <Kbd>]</Kbd> 换项目
-                      </>
-                    )}
-                  </span>
-                </div>
+                <span className="shrink-0" title="J / K 上下切换">
+                  <Kbd>X</Kbd> 多选 · <Kbd>⇧↵</Kbd> 全部派出
+                </span>
               </div>
               {items.length === 0 ? (
                 <Empty
@@ -407,7 +402,7 @@ export function DispatchPage() {
                       <button
                         onClick={() => g.id !== null && setProject(g.id)}
                         title="只看这个项目"
-                        className="group/h sticky top-[73px] z-[2] flex w-full items-center gap-1.5 border-b border-line/70 bg-sunken/95 px-4 py-1.5 text-left text-[12px] font-semibold text-ink-2 backdrop-blur hover:text-ink"
+                        className="group/h sticky top-11 z-[2] flex w-full items-center gap-1.5 border-b border-line/70 bg-sunken/95 px-4 py-1.5 text-left text-[12px] font-semibold text-ink-2 backdrop-blur hover:text-ink"
                       >
                         <span className="truncate">{g.title}</span>
                         <span className="font-normal text-ink-3 tabular-nums">{g.items.length}</span>
@@ -547,20 +542,6 @@ export function DispatchPage() {
         }}
       />
     </div>
-  );
-}
-
-function ProjectChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
-  return (
-    <button
-      onClick={onClick}
-      className={clsx(
-        "inline-flex h-7 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[12.5px] transition-colors",
-        active ? "border-ink/80 bg-ink text-canvas [&_.text-ink-3]:text-canvas/60" : "border-line bg-panel text-ink-2 hover:bg-hover",
-      )}
-    >
-      {children}
-    </button>
   );
 }
 
