@@ -13,6 +13,7 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
 ![MCP](https://img.shields.io/badge/MCP-29%20tools-8e4ec6)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![M8ven Score](https://m8ven.ai/badge/mcp/willsshan-redpilot-4su6ow?v=1d6478468f2b98b4fbf0537dd8e54c8c)](https://m8ven.ai/mcp/willsshan-redpilot-4su6ow?s=readme)
 
 </div>
 
