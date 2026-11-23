@@ -39,6 +39,61 @@ pub struct Usage {
     pub completion_tokens: u64,
 }
 
+fn default_function_type() -> String {
+    "function".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "default_function_type")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn system(c: impl Into<String>) -> Self {
+        Self { role: "system".into(), content: Some(c.into()), tool_calls: None, tool_call_id: None }
+    }
+    pub fn user(c: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: Some(c.into()), tool_calls: None, tool_call_id: None }
+    }
+    pub fn assistant(c: impl Into<String>) -> Self {
+        Self { role: "assistant".into(), content: Some(c.into()), tool_calls: None, tool_call_id: None }
+    }
+    pub fn assistant_tool_calls(content: Option<String>, calls: Vec<ToolCall>) -> Self {
+        Self { role: "assistant".into(), content, tool_calls: Some(calls), tool_call_id: None }
+    }
+    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: "tool".into(), content: Some(content.into()), tool_calls: None, tool_call_id: Some(id.into()) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolChatReply {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Usage,
+}
+
 impl AiClient {
     pub fn new(base_url: &str, key: &str, model: &str, json_mode: bool, temperature: f32, proxy: &str) -> Result<Self> {
         let base = base_url.trim().trim_end_matches('/');
@@ -121,6 +176,68 @@ impl AiClient {
         let v = extract_json(&text).ok_or_else(|| anyhow!("AI 输出不是合法 JSON：{}", crate::redmine::truncate(&text, 200)))?;
         let parsed = serde_json::from_value(v).context("AI 输出的 JSON 结构不符合预期")?;
         Ok((parsed, usage))
+    }
+
+    /// 支持 OpenAI Function Calling（tools）的多轮对话请求
+    pub async fn chat_with_tools(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<ToolChatReply> {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": false,
+        });
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.to_vec());
+            body["tool_choice"] = json!("auto");
+        }
+        let mut req = self.http.post(&self.endpoint).json(&body);
+        if !self.key.is_empty() {
+            req = req.bearer_auth(&self.key);
+        }
+        let resp = req.send().await.map_err(|e| anyhow!("连接 AI 服务失败: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| crate::redmine::truncate(&text, 200));
+            return Err(match status.as_u16() {
+                401 => crate::coded("AI_AUTH", format!("AI API Key 无效: {msg}")),
+                402 => crate::coded("AI_BALANCE", format!("AI 账户余额不足: {msg}")),
+                429 => crate::coded("AI_RATE_LIMIT", format!("AI 请求过于频繁，请稍后再试: {msg}")),
+                _ => crate::coded("AI_HTTP", format!("AI 服务返回 HTTP {status}: {msg}")),
+            });
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            choices: Vec<Choice>,
+            #[serde(default)]
+            usage: Usage,
+        }
+        #[derive(Deserialize)]
+        struct Choice {
+            message: ChoiceMsg,
+        }
+        #[derive(Deserialize)]
+        struct ChoiceMsg {
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            tool_calls: Option<Vec<ToolCall>>,
+        }
+        let r: Resp = serde_json::from_str(&text).context("AI 返回格式无法解析")?;
+        let msg = r
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow!("AI 未返回内容"))?;
+        Ok(ToolChatReply {
+            content: msg.content.unwrap_or_default(),
+            tool_calls: msg.tool_calls.unwrap_or_default(),
+            usage: r.usage,
+        })
     }
 }
 

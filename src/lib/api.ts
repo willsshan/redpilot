@@ -501,6 +501,52 @@ export interface McpStatus {
   exePath: string;
 }
 
+// ---------- AI 对话助手 ----------
+
+export interface ChatHistoryItem {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface ChatRequest {
+  messages: ChatHistoryItem[];
+  autoExecuteWrites?: boolean;
+  recentProjectIds?: number[];
+}
+
+export interface ChatToolStep {
+  tool: string;
+  label: string;
+  summary: string;
+  ok: boolean;
+  write: boolean;
+}
+
+export interface PendingAction {
+  id: string;
+  tool: string;
+  title: string;
+  details: string[];
+  args: Record<string, unknown>;
+  projectIds: number[];
+}
+
+export interface ChatReply {
+  content: string;
+  steps: ChatToolStep[];
+  pendingActions: PendingAction[];
+  touchedProjectIds: number[];
+}
+
+export interface ActionExecutionResult {
+  id: string;
+  tool: string;
+  title: string;
+  ok: boolean;
+  summary: string;
+  projectIds: number[];
+}
+
 export type AppEvent =
   | { type: "syncStarted" }
   | { type: "syncFinished"; report: SyncReport }
@@ -571,6 +617,8 @@ export const api = {
   mcpStatus: () => invoke<McpStatus>("mcp_status"),
   restartMcp: () => invoke<McpStatus>("restart_mcp"),
   regenerateMcpToken: () => invoke<McpStatus>("regenerate_mcp_token"),
+  chatSend: (req: ChatRequest) => invoke<ChatReply>("chat_send", { req }),
+  chatExecuteActions: (actions: PendingAction[]) => invoke<ActionExecutionResult[]>("chat_execute_actions", { actions }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
 };
 

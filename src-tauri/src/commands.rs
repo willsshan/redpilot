@@ -1,5 +1,6 @@
 //! 前端调用的 Tauri 命令，均为对 `redpilot_core::Service` 的薄封装。
 
+use redpilot_core::chat::{ActionExecutionResult, ChatReply, ChatRequest, PendingAction};
 use redpilot_core::mcp::{self, HttpHandle};
 use redpilot_core::models::*;
 use redpilot_core::secrets::SecretKind;
@@ -390,6 +391,16 @@ pub async fn restart_mcp(state: State<'_, AppState>) -> CmdResult<McpStatus> {
 pub async fn regenerate_mcp_token(state: State<'_, AppState>) -> CmdResult<McpStatus> {
     state.svc.regenerate_mcp_token().map_err(e)?;
     Ok(state.restart_mcp().await)
+}
+
+#[tauri::command]
+pub async fn chat_send(state: State<'_, AppState>, req: ChatRequest) -> CmdResult<ChatReply> {
+    redpilot_core::chat::chat(&state.svc, req).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn chat_execute_actions(state: State<'_, AppState>, actions: Vec<PendingAction>) -> CmdResult<Vec<ActionExecutionResult>> {
+    Ok(redpilot_core::chat::execute_actions(&state.svc, actions).await)
 }
 
 #[tauri::command]

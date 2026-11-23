@@ -57,7 +57,7 @@ function score(text: string, query: string): number {
 }
 
 export function CommandPalette() {
-  const { setPage, dispatch, sync, config, setFocusIssue } = useApp();
+  const { setPage, dispatch, sync, config, setFocusIssue, setChatOpen } = useApp();
   const toast = useToast();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -106,6 +106,18 @@ export function CommandPalette() {
       run: () => go("settings", { type: "settingsSection", id }),
     });
     const list: Item[] = [
+      {
+        id: "ai-chat",
+        group: "命令",
+        title: "打开 AI 对话助手",
+        subtitle: "通过对话直接查询、关闭、指派或新建 Redmine 问题",
+        keywords: "ai chat duihua assistant redmine close query",
+        icon: <Sparkles className="size-4" />,
+        run: () => {
+          setChatOpen(true);
+          close();
+        },
+      },
       { id: "sync", group: "命令", title: "立即同步", subtitle: "从 Redmine 拉取最新任务", keywords: "sync refresh tongbu", icon: <RefreshCw className="size-4" />, run: () => (void sync(), close()) },
       {
         id: "analyze",

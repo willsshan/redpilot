@@ -130,6 +130,8 @@ pub fn run() {
             commands::mcp_status,
             commands::restart_mcp,
             commands::regenerate_mcp_token,
+            commands::chat_send,
+            commands::chat_execute_actions,
             commands::open_url,
         ])
         .build(tauri::generate_context!())

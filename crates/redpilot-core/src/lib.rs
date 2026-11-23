@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod analysis;
+pub mod chat;
 pub mod config;
 pub mod db;
 pub mod mask;

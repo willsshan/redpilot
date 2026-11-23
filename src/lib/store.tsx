@@ -34,6 +34,10 @@ interface AppState {
   /** 跳转到页面并让页面执行指令 */
   dispatch: (page: Page, intent?: Intent) => void;
   clearIntent: () => void;
+  /** 内置 AI 对话框开关 */
+  chatOpen: boolean;
+  setChatOpen: (open: boolean) => void;
+  toggleChat: () => void;
 }
 
 const Ctx = createContext<AppState | null>(null);
@@ -60,6 +64,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [rev, setRev] = useState(0);
   const [focusIssue, setFocusIssue] = useState<number | null>(null);
   const [intent, setIntent] = useState<Intent | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const toggleChat = useCallback(() => setChatOpen((o) => !o), []);
   const dispatch = useCallback((p: Page, i?: Intent) => {
     setPage(p);
     setIntent(i ?? null);
@@ -162,6 +168,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         intent,
         dispatch,
         clearIntent,
+        chatOpen,
+        setChatOpen,
+        toggleChat,
       }}
     >
       {children}

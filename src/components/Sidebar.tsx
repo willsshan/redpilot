@@ -1,12 +1,12 @@
 import clsx from "clsx";
-import { BarChart3, FolderKanban, Forward, Inbox, RefreshCw, Search, Settings, Sparkles, Plug } from "lucide-react";
+import { BarChart3, Bot, FolderKanban, Forward, Inbox, RefreshCw, Search, Settings, Sparkles, Plug } from "lucide-react";
 import type { ReactNode } from "react";
 import { useApp, type Page } from "../lib/store";
 import { isMac, modKey, relativeTime } from "../lib/format";
 import { useEffect, useState } from "react";
 
 export function Sidebar() {
-  const { page, setPage, stats, syncing, sync, mcp, analyzing, secrets, config } = useApp();
+  const { page, setPage, stats, syncing, sync, mcp, analyzing, secrets, config, chatOpen, toggleChat } = useApp();
   const [, tick] = useState(0);
   // 每 30 秒刷新“x 分钟前同步”
   useEffect(() => {
@@ -31,11 +31,25 @@ export function Sidebar() {
 
       <button
         onClick={() => window.dispatchEvent(new Event("redpilot:palette"))}
-        className="mx-2.5 mb-3 flex h-8 items-center gap-2 rounded-lg border border-line bg-panel px-2.5 text-[12.5px] text-ink-3 shadow-[0_1px_1px_rgb(0_0_0/0.03)] hover:text-ink-2"
+        className="mx-2.5 mb-1.5 flex h-8 items-center gap-2 rounded-lg border border-line bg-panel px-2.5 text-[12.5px] text-ink-3 shadow-[0_1px_1px_rgb(0_0_0/0.03)] hover:text-ink-2"
       >
         <Search className="size-3.5" />
         <span className="flex-1 text-left">搜索或执行命令</span>
         <span className="text-[11px] tracking-wide">{modKey}K</span>
+      </button>
+
+      <button
+        onClick={toggleChat}
+        className={clsx(
+          "mx-2.5 mb-3 flex h-8 items-center gap-2 rounded-lg border px-2.5 text-[12.5px] shadow-[0_1px_1px_rgb(0_0_0/0.03)] transition-colors",
+          chatOpen
+            ? "border-accent/50 bg-accent-soft text-accent-ink font-medium"
+            : "border-line bg-panel text-ink-2 hover:border-accent/40 hover:text-ink",
+        )}
+      >
+        <Bot className={clsx("size-3.5", chatOpen ? "text-accent" : "text-[#8e4ec6]")} />
+        <span className="flex-1 text-left">AI 对话助手</span>
+        <span className="text-[11px] tracking-wide text-ink-3">{modKey}J</span>
       </button>
 
       <nav className="flex flex-col gap-0.5 px-2.5">

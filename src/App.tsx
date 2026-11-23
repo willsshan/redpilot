@@ -1,3 +1,4 @@
+import { AiChatDrawer } from "./components/AiChatDrawer";
 import { Sidebar } from "./components/Sidebar";
 import { CommandPalette } from "./components/CommandPalette";
 import { AppProvider, useApp } from "./lib/store";
@@ -23,6 +24,7 @@ function Shell() {
         {page === "settings" && <SettingsPage />}
       </main>
       <CommandPalette />
+      <AiChatDrawer />
     </div>
   );
 }

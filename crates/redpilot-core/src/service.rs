@@ -241,6 +241,22 @@ impl Service {
         self.ai_client(false).is_ok()
     }
 
+    pub(crate) fn ai_client_for_chat(&self) -> Result<AiClient> {
+        self.ai_client(false)
+    }
+
+    pub(crate) fn record_usage_for(&self, purpose: &str, model: &str, u: Usage) {
+        self.record_usage(purpose, model, u);
+    }
+
+    pub(crate) fn mask_for_ai(&self, text: &str) -> String {
+        self.prep_for_ai(text)
+    }
+
+    pub(crate) fn invalidate_overviews(&self) {
+        write(&self.overviews, HashMap::new());
+    }
+
     fn record_usage(&self, purpose: &str, model: &str, u: Usage) {
         if let Err(e) = self.db.record_usage(purpose, model, u.prompt_tokens, u.completion_tokens) {
             tracing::warn!("记录 AI 用量失败: {e}");
@@ -1032,8 +1048,60 @@ impl Service {
             ..Default::default()
         };
         let out = self.apply_update(id, plan).await?;
+        self.invalidate_overviews();
         self.emit(AppEvent::IssuesChanged);
         Ok(out)
+    }
+
+    /// 关闭任务：未指定 status_id 时自动选用 Redmine 中标记为关闭的状态（优先名称含“关闭/closed”）
+    pub async fn close_issue(
+        &self,
+        id: u64,
+        status_id: Option<u64>,
+        notes: Option<String>,
+        done_ratio: Option<u32>,
+    ) -> Result<ResolveOutcome> {
+        let sid = match status_id {
+            Some(s) => s,
+            None => self.default_closed_status_id().await?,
+        };
+        let plan = UpdatePlan {
+            notes: notes.filter(|n| !n.trim().is_empty()),
+            status_id: Some(sid),
+            done_ratio: done_ratio.or_else(|| self.config().workflow.set_done_ratio.then_some(100)),
+            ..Default::default()
+        };
+        let out = self.apply_update(id, plan).await?;
+        self.invalidate_overviews();
+        self.emit(AppEvent::IssuesChanged);
+        Ok(out)
+    }
+
+    /// 自动识别 Redmine 的默认关闭状态 ID
+    pub async fn default_closed_status_id(&self) -> Result<u64> {
+        let statuses = self.statuses().await?;
+        let closed: Vec<&NamedId> = statuses.iter().filter(|s| s.is_closed == Some(true)).collect();
+        if let Some(s) = closed.iter().find(|s| {
+            let n = s.name.to_lowercase();
+            n.contains("关闭") || n.contains("closed")
+        }) {
+            return Ok(s.id);
+        }
+        if let Some(s) = closed.first() {
+            return Ok(s.id);
+        }
+        Err(coded("NO_CLOSED_STATUS", "Redmine 中没有找到标记为“已关闭”的任务状态，请指定具体的状态 ID"))
+    }
+
+    /// 在指定项目下新建任务
+    pub async fn create_issue(&self, n: &NewIssue) -> Result<Issue> {
+        if n.subject.trim().is_empty() {
+            return Err(coded("SUBJECT_EMPTY", "任务标题不能为空"));
+        }
+        let created = self.redmine()?.create_issue(n).await?;
+        self.invalidate_overviews();
+        self.emit(AppEvent::IssuesChanged);
+        Ok(created)
     }
 
     /// 把前端选择或粘贴的文件暂存到数据目录，回派时再上传（每个任务都要单独上传一份）
