@@ -5,6 +5,7 @@ import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { modKey, noteTemplate } from "../lib/format";
 import { clearTimer, msToHours, timerElapsed } from "../lib/timer";
+import { recordRecentProject } from "../lib/recentProjects";
 import { Avatar, Button, Field, Input, Modal, Select, Switch, Textarea } from "./ui";
 import { AttachmentBar, DropOverlay, imageRef, useFileDrop, useStagedFiles } from "./Attachments";
 
@@ -99,6 +100,7 @@ export function ResolveDialog({
       attachments: att.files.map((f) => f.path),
     };
     const reqs: ResolveRequest[] = issues.map((i) => ({ ...base, issueId: i.id }));
+    const projectIds = [...new Set(issues.map((i) => i.projectId))];
     onClose();
 
     const who = batch ? `${issues.length} 个任务` : `#${issues[0].id}`;
@@ -108,6 +110,7 @@ export function ResolveDialog({
         const ok = outs.filter((o) => o.ok);
         const failed = outs.filter((o) => !o.ok);
         ok.forEach((o) => clearTimer(o.issueId));
+        if (ok.length > 0) projectIds.forEach((pid) => recordRecentProject(pid));
         toast.show({
           tone: failed.length ? "warn" : "success",
           title: `已处理 ${ok.length} 个任务${failed.length ? `，${failed.length} 个失败` : ""}`,
@@ -115,14 +118,15 @@ export function ResolveDialog({
         });
         return;
       }
-      await resolveOne(reqs[0]);
+      await resolveOne(reqs[0], projectIds[0]);
     });
   }
 
-  async function resolveOne(req: ResolveRequest) {
+  async function resolveOne(req: ResolveRequest, projectId?: number) {
     try {
       const out = await api.resolveIssue(req);
       clearTimer(req.issueId);
+      recordRecentProject(projectId);
       toast.show({
         tone: out.warnings.length ? "warn" : "success",
         title: req.assignToAuthor || req.assignToId ? `#${req.issueId} 已指派给 ${out.assignedTo ?? "目标成员"}` : `#${req.issueId} 已提交`,
@@ -138,7 +142,7 @@ export function ResolveDialog({
             tone: "error",
             title: `无法指派给${req.assignToId ? "该成员" : "提出人"}`,
             body: errorText(e),
-            action: { label: "仅提交说明", onClick: () => void resolveOne({ ...req, assignToAuthor: false, assignToId: null }) },
+            action: { label: "仅提交说明", onClick: () => void resolveOne({ ...req, assignToAuthor: false, assignToId: null }, projectId) },
           },
           12000,
         );

@@ -5,6 +5,7 @@ import { api, errorText, type IssueDetail as Detail, type IssueView, type NamedI
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { categoryColor, dateTime, dueLabel, isMac, priorityTone, relativeTime } from "../lib/format";
+import { partitionRecent, recordRecentProject, sortByRecent, useRecentProjects } from "../lib/recentProjects";
 import { Avatar, Badge, Button, CategoryBadge, Empty, Kbd } from "../components/ui";
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
@@ -106,6 +107,7 @@ export function InboxPage() {
   const [sortBy, setSortByState] = useState<SortBy>(() => stored("rp.list.sort", ["created", "updated", "priority", "due"] as const, "created"));
   const [listGroup, setListGroupState] = useState<ListGroup>(() => stored("rp.list.group", ["month", "project", "none"] as const, "month"));
   const [project, setProject] = useState<number | null>(null);
+  const recentIds = useRecentProjects();
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [drawer, setDrawer] = useState(false);
   const [statuses, setStatuses] = useState<NamedId[]>([]);
@@ -174,8 +176,13 @@ export function InboxPage() {
       p.count += 1;
       m.set(i.projectId, p);
     }
-    return [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "zh-CN"));
-  }, [issues]);
+    const base = [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "zh-CN"));
+    return sortByRecent(base, recentIds, (p) => p.id);
+  }, [issues, recentIds]);
+  const { recent: recentProjects, rest: otherProjects } = useMemo(
+    () => partitionRecent(projects, recentIds, (p) => p.id),
+    [projects, recentIds],
+  );
 
   // 选中的项目同步后不存在了，就回到全部项目
   useEffect(() => {
@@ -447,15 +454,38 @@ export function InboxPage() {
         >
           <select
             value={project ?? ""}
-            onChange={(e) => setProject(e.target.value ? Number(e.target.value) : null)}
+            onChange={(e) => {
+              const id = e.target.value ? Number(e.target.value) : null;
+              setProject(id);
+              if (id !== null) recordRecentProject(id);
+            }}
             className="absolute inset-0 cursor-default opacity-0"
           >
             <option value="">全部项目（{issues.length}）</option>
-            {projects.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}（{p.count}）
-              </option>
-            ))}
+            {recentProjects.length > 0 && otherProjects.length > 0 ? (
+              <>
+                <optgroup label="最近使用">
+                  {recentProjects.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}（{p.count}）
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="其他项目">
+                  {otherProjects.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}（{p.count}）
+                    </option>
+                  ))}
+                </optgroup>
+              </>
+            ) : (
+              projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}（{p.count}）
+                </option>
+              ))
+            )}
           </select>
           <span className="max-w-[160px] truncate">{project !== null ? (projects.find((p) => p.id === project)?.name ?? "项目") : "全部项目"}</span>
           <ChevronDown className="pointer-events-none absolute right-2 size-3" />
@@ -501,6 +531,8 @@ export function InboxPage() {
               onOpen={(id) => {
                 setSelected(id);
                 setDrawer(true);
+                const hit = issues.find((x) => x.id === id);
+                if (hit) recordRecentProject(hit.projectId);
               }}
               onMove={(i, k) => void moveCard(i, k)}
               onResolve={(i) => setResolveFor([i])}
@@ -599,7 +631,10 @@ export function InboxPage() {
                             issue={i}
                             active={i.id === selected}
                             checked={checked.has(i.id)}
-                            onClick={() => setSelected(i.id)}
+                            onClick={() => {
+                              setSelected(i.id);
+                              recordRecentProject(i.projectId);
+                            }}
                             onCheck={() => toggleCheck(i.id)}
                             showProject={listGroup !== "project"}
                             showUpdated={sortBy === "updated"}

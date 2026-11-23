@@ -5,6 +5,7 @@ import { api, errorText, type IssueDetail as Detail, type ProjectAccess, type Pr
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { dueLabel, isMac, priorityTone, relativeTime } from "../lib/format";
+import { getRecentProjects, partitionRecent, recordRecentProject, sortByRecent, useRecentProjects } from "../lib/recentProjects";
 import { Avatar, Badge, Button, Card, Empty, SectionTitle, Spinner } from "../components/ui";
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog, ResolveDialog } from "../components/ResolveDialog";
@@ -34,6 +35,7 @@ export function ProjectPage() {
   const toast = useToast();
   const [projects, setProjects] = useState<ProjectAccess[] | null>(null);
   const [projectId, setProjectId] = useState<number | null>(storedProject);
+  const recentIds = useRecentProjects();
   const [ov, setOv] = useState<ProjectOverview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -64,7 +66,8 @@ export function ProjectPage() {
       .myProjects()
       .then((ps) => {
         setProjects(ps);
-        setProjectId((cur) => (cur && ps.some((p) => p.id === cur) ? cur : (ps[0]?.id ?? null)));
+        const firstRecent = getRecentProjects().find((id) => ps.some((p) => p.id === id));
+        setProjectId((cur) => (cur && ps.some((p) => p.id === cur) ? cur : (firstRecent ?? ps[0]?.id ?? null)));
       })
       .catch((e) => {
         setProjects([]);
@@ -201,6 +204,17 @@ export function ProjectPage() {
     );
   }
 
+  const { recentProjects, restManaged, restMember } = useMemo(() => {
+    const list = projects ?? [];
+    const { recent, rest } = partitionRecent(list, recentIds, (p) => p.id);
+    const orderedRest = sortByRecent(rest, recentIds, (p) => p.id);
+    return {
+      recentProjects: recent,
+      restManaged: orderedRest.filter((p) => p.isManager),
+      restMember: orderedRest.filter((p) => !p.isManager),
+    };
+  }, [projects, recentIds]);
+
   const current = projects?.find((p) => p.id === projectId);
   const weekly = ov?.weekly ?? [];
   const thisWeek = weekly[weekly.length - 1];
@@ -223,29 +237,38 @@ export function ProjectPage() {
           <label className="relative inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-panel pr-7 pl-2.5 text-[13px] font-medium hover:bg-hover">
             <select
               value={projectId ?? ""}
-              onChange={(e) => setProjectId(Number(e.target.value))}
+              onChange={(e) => {
+                const id = Number(e.target.value);
+                setProjectId(id);
+                recordRecentProject(id);
+              }}
               className="absolute inset-0 cursor-default opacity-0"
             >
-              {projects.some((p) => p.isManager) && (
-                <optgroup label="我管理的项目">
-                  {projects
-                    .filter((p) => p.isManager)
-                    .map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
+              {recentProjects.length > 0 && (
+                <optgroup label="最近使用">
+                  {recentProjects.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
                 </optgroup>
               )}
-              {projects.some((p) => !p.isManager) && (
+              {restManaged.length > 0 && (
+                <optgroup label="我管理的项目">
+                  {restManaged.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {restMember.length > 0 && (
                 <optgroup label="我参与的项目">
-                  {projects
-                    .filter((p) => !p.isManager)
-                    .map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
+                  {restMember.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
                 </optgroup>
               )}
             </select>

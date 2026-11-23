@@ -15,6 +15,7 @@ import {
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { dateTime, dueLabel, isMac, priorityTone, relativeTime } from "../lib/format";
+import { partitionRecent, recordRecentProject, sortByRecent, useRecentProjects } from "../lib/recentProjects";
 import { Avatar, Badge, Button, Empty, Input, Kbd, Modal, Select, Textarea } from "../components/ui";
 import { IssueDetail } from "../components/IssueDetail";
 import { FollowUpDialog } from "../components/ResolveDialog";
@@ -59,11 +60,35 @@ export function DispatchPage() {
   const [dupFor, setDupFor] = useState<number | null>(null);
   const [aiBusy, setAiBusy] = useState<"all" | number | null>(null);
   const [project, setProjectState] = useState<number | null>(storedProject);
+  const recentIds = useRecentProjects();
   const loadSeq = useRef(0);
+  const cycleRecordTimer = useRef<number | null>(null);
 
-  const setProject = useCallback((id: number | null) => {
+  useEffect(
+    () => () => {
+      if (cycleRecordTimer.current !== null) window.clearTimeout(cycleRecordTimer.current);
+    },
+    [],
+  );
+
+  const setProject = useCallback((id: number | null, opts?: { deferRecord?: boolean }) => {
     setProjectState(id);
     setChecked(new Set());
+    if (cycleRecordTimer.current !== null) {
+      window.clearTimeout(cycleRecordTimer.current);
+      cycleRecordTimer.current = null;
+    }
+    if (id !== null) {
+      if (opts?.deferRecord) {
+        // [ / ] 连续切换项目时延后记录，避免切换中途选项顺序跳动
+        cycleRecordTimer.current = window.setTimeout(() => {
+          cycleRecordTimer.current = null;
+          recordRecentProject(id);
+        }, 1200);
+      } else {
+        recordRecentProject(id);
+      }
+    }
     try {
       if (id === null) localStorage.removeItem(PROJECT_KEY);
       else localStorage.setItem(PROJECT_KEY, String(id));
@@ -96,7 +121,7 @@ export function DispatchPage() {
   }, [load, rev, configured]);
 
   const all = useMemo(() => (queue?.items ?? []).filter((i) => !hidden.has(i.issue.id)), [queue, hidden]);
-  // 各项目的待分派数，多的在前
+  // 各项目的待分派数：最近使用的项目在前，其余按数量倒序
   const projectCounts = useMemo(() => {
     const m = new Map<number, { id: number; name: string; count: number }>();
     for (const i of all) {
@@ -104,8 +129,13 @@ export function DispatchPage() {
       p.count += 1;
       m.set(p.id, p);
     }
-    return [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "zh-CN"));
-  }, [all]);
+    const base = [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "zh-CN"));
+    return sortByRecent(base, recentIds, (p) => p.id);
+  }, [all, recentIds]);
+  const { recent: recentProjects, rest: otherProjects } = useMemo(
+    () => partitionRecent(projectCounts, recentIds, (p) => p.id),
+    [projectCounts, recentIds],
+  );
   // 选了项目只看这个项目；全部项目时按项目分组（只有一个项目时不分组）
   const groups: ProjectGroup[] = useMemo(() => {
     if (project !== null) return [{ id: project, title: null, items: all.filter((i) => i.issue.projectId === project) }];
@@ -156,6 +186,7 @@ export function DispatchPage() {
 
   function submitOne(req: DispatchRequest, title: string) {
     const id = req.issueId;
+    const pid = queue?.items.find((i) => i.issue.id === id)?.issue.projectId;
     hide([id]);
     setCustom(null);
     toast.withUndo(
@@ -163,6 +194,7 @@ export function DispatchPage() {
       async () => {
         try {
           const t = outcomeToast(await api.dispatchIssue(req));
+          recordRecentProject(pid);
           toast.show({ tone: t.warn ? "warn" : "success", title: t.title, body: t.body });
         } catch (e) {
           unhide([id]);
@@ -185,11 +217,13 @@ export function DispatchPage() {
       return;
     }
     const ids = reqs.map((r) => r.issueId);
+    const pids = [...new Set(targets.filter((t) => ids.includes(t.issue.id)).map((t) => t.issue.projectId))];
     hide(ids);
     toast.withUndo(
       to ? `正在把 ${reqs.length} 个任务派给 ${to.name}` : `正在按推荐派出 ${reqs.length} 个任务${skipped ? `（${skipped} 个没有推荐，已跳过）` : ""}`,
       async () => {
         const outs = await api.dispatchBatch(reqs);
+        if (outs.some((o) => o.ok)) pids.forEach((pid) => recordRecentProject(pid));
         const failed = outs.filter((o) => !o.ok);
         unhide(failed.map((f) => f.issueId));
         toast.show({
@@ -208,9 +242,11 @@ export function DispatchPage() {
   }
 
   async function keep(id: number) {
+    const pid = queue?.items.find((i) => i.issue.id === id)?.issue.projectId;
     hide([id]);
     try {
       await api.dispatchKeep(id);
+      recordRecentProject(pid);
       toast.show({
         tone: "success",
         title: `#${id} 留给自己处理`,
@@ -273,7 +309,7 @@ export function DispatchPage() {
         e.preventDefault();
         const order: (number | null)[] = [null, ...projectCounts.map((p) => p.id)];
         const at = Math.max(0, order.indexOf(project));
-        setProject(order[(at + (e.key === "]" ? 1 : -1) + order.length) % order.length]);
+        setProject(order[(at + (e.key === "]" ? 1 : -1) + order.length) % order.length], { deferRecord: true });
       } else if (e.key === "Escape") {
         setChecked(new Set());
       } else if (e.key === "Enter" && e.shiftKey) {
@@ -373,11 +409,30 @@ export function DispatchPage() {
                       title={projectCounts.length > 1 ? "按 [ 和 ] 也可以切换项目" : undefined}
                     >
                       <option value="">全部项目（{all.length}）</option>
-                      {projectCounts.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name}（{p.count}）
-                        </option>
-                      ))}
+                      {recentProjects.length > 0 && otherProjects.length > 0 ? (
+                        <>
+                          <optgroup label="最近使用">
+                            {recentProjects.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}（{p.count}）
+                              </option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="其他项目">
+                            {otherProjects.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}（{p.count}）
+                              </option>
+                            ))}
+                          </optgroup>
+                        </>
+                      ) : (
+                        projectCounts.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name}（{p.count}）
+                          </option>
+                        ))
+                      )}
                       {project !== null && !projectCounts.some((p) => p.id === project) && <option value={project}>{projectName}（0）</option>}
                     </Select>
                   </div>
@@ -523,6 +578,7 @@ export function DispatchPage() {
         onClose={() => setDupFor(null)}
         onSubmit={(original, notes, statusId) => {
           const id = dupFor!;
+          const pid = queue?.items.find((i) => i.issue.id === id)?.issue.projectId;
           setDupFor(null);
           hide([id]);
           toast.withUndo(
@@ -530,6 +586,7 @@ export function DispatchPage() {
             async () => {
               try {
                 await api.markDuplicate(id, original, notes, statusId);
+                recordRecentProject(pid);
                 toast.show({ tone: "success", title: `#${id} 已标为与 #${original} 重复`, body: `#${original} 关闭时 Redmine 会一并关闭 #${id}` });
               } catch (e) {
                 unhide([id]);

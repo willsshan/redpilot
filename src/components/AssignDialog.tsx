@@ -4,6 +4,7 @@ import { ArrowRight, History, Sparkles, Users } from "lucide-react";
 import { api, errorText, type Assignee, type AssignSuggestion, type ProjectIssue } from "../lib/api";
 import { useToast } from "../lib/toast";
 import { modKey } from "../lib/format";
+import { recordRecentProject } from "../lib/recentProjects";
 import { Badge, Button, Modal, Select, Textarea } from "./ui";
 
 export const SOURCE_LABEL: Record<AssignSuggestion["source"], string> = {
@@ -123,6 +124,7 @@ export function AssignDialog({
       const outs = await api.bulkAssign(items, notes.trim() || null);
       const ok = outs.filter((o) => o.ok);
       const failed = outs.filter((o) => !o.ok);
+      if (ok.length > 0) recordRecentProject(projectId);
       toast.show({
         tone: failed.length ? "warn" : "success",
         title: `已转派 ${ok.length} 个任务${failed.length ? `，${failed.length} 个失败` : ""}`,

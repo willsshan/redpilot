@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, errorText, type DispatchQueue, type SplitPart } from "../lib/api";
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
+import { recordRecentProject } from "../lib/recentProjects";
 import { Modal, Spinner } from "./ui";
 import { DispatchPanel, outcomeToast } from "./DispatchPanel";
 import { SplitDialog } from "./SplitDialog";
@@ -52,10 +53,12 @@ export function DispatchDialog({ issueId, onClose, onDone }: { issueId: number |
             onClearCustom={() => setCustom(null)}
             onEditSplit={(parts) => setSplitParts(parts)}
             onSubmit={(req, title) => {
+              const pid = item.issue.projectId;
               onClose();
               toast.withUndo(`#${req.issueId} ${title}`, async () => {
                 try {
                   const t = outcomeToast(await api.dispatchIssue(req));
+                  recordRecentProject(pid);
                   toast.show({ tone: t.warn ? "warn" : "success", title: t.title, body: t.body });
                 } catch (e) {
                   toast.show({ tone: "error", title: `#${req.issueId} 转派失败`, body: errorText(e) });

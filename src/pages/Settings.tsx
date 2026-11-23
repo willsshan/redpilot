@@ -5,6 +5,7 @@ import { api, errorText, type AppConfig, type NamedId, type ProjectAccess, type 
 import { useApp } from "../lib/store";
 import { useToast } from "../lib/toast";
 import { isMac } from "../lib/format";
+import { RECENT_GROUP_LIMIT, sortByRecent, useRecentProjects } from "../lib/recentProjects";
 import { Badge, Button, Card, Field, Input, Select, Switch, Textarea } from "../components/ui";
 
 const DEFAULT_RULES: AppConfig["rules"] = [
@@ -38,6 +39,13 @@ export function SettingsPage() {
   const [activities, setActivities] = useState<NamedId[]>([]);
   const [projects, setProjects] = useState<{ id: number; name: string }[]>([]);
   const [myProjects, setMyProjects] = useState<ProjectAccess[]>([]);
+  const recentIds = useRecentProjects();
+  const recentTop = useMemo(() => new Set(recentIds.slice(0, RECENT_GROUP_LIMIT)), [recentIds]);
+  const sortedProjects = useMemo(
+    () => sortByRecent([...projects].sort((a, b) => a.name.localeCompare(b.name, "zh-CN")), recentIds, (p) => p.id),
+    [projects, recentIds],
+  );
+  const sortedMyProjects = useMemo(() => sortByRecent(myProjects, recentIds, (p) => p.id), [myProjects, recentIds]);
   const [clientTab, setClientTab] = useState<"claude" | "http" | "stdio">("claude");
   const [autostart, setAutostart] = useState<boolean | null>(null);
 
@@ -356,11 +364,12 @@ export function SettingsPage() {
               </div>
               <Toggle label="JSON 输出模式" desc="部分推理模型或本地模型不支持时请关闭" checked={draft.ai.jsonMode} onChange={(v) => set("ai", { jsonMode: v })} />
               <Toggle label="发送前脱敏" desc="自动遮盖手机号、身份证、邮箱、IP、密码、密钥串等" checked={draft.ai.maskSensitive} onChange={(v) => set("ai", { maskSensitive: v })} />
-              {projects.length > 0 && (
+              {sortedProjects.length > 0 && (
                 <Field label="不发送给 AI 的项目" hint="涉密项目勾选后，其任务内容不会发送给 AI">
                   <div className="flex flex-wrap gap-2">
-                    {projects.map((p) => {
+                    {sortedProjects.map((p) => {
                       const on = draft.ai.excludedProjectIds.includes(p.id);
+                      const isRecent = recentTop.has(p.id);
                       return (
                         <button
                           key={p.id}
@@ -368,9 +377,13 @@ export function SettingsPage() {
                             e.preventDefault();
                             set("ai", { excludedProjectIds: on ? draft.ai.excludedProjectIds.filter((x) => x !== p.id) : [...draft.ai.excludedProjectIds, p.id] });
                           }}
-                          className={clsx("rounded-full border px-2.5 py-1 text-[12.5px]", on ? "border-accent bg-accent-soft text-accent-ink" : "border-line text-ink-2 hover:bg-hover")}
+                          className={clsx(
+                            "inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px]",
+                            on ? "border-accent bg-accent-soft text-accent-ink" : "border-line text-ink-2 hover:bg-hover",
+                          )}
                         >
                           {p.name}
+                          {isRecent && <span className="text-[11px] text-ink-3">最近</span>}
                         </button>
                       );
                     })}
@@ -513,7 +526,11 @@ export function SettingsPage() {
               </Field>
               <Field label="拉取未指派任务的项目" hint="都不选时为你担任管理角色的项目">
                 <ChipPicker
-                  options={myProjects.map((p) => ({ id: p.id, name: p.name, hint: p.isManager ? "管理" : undefined }))}
+                  options={sortedMyProjects.map((p) => ({
+                    id: p.id,
+                    name: p.name,
+                    hint: [p.isManager ? "管理" : "", recentTop.has(p.id) ? "最近" : ""].filter(Boolean).join(" · ") || undefined,
+                  }))}
                   value={draft.dispatch.projectIds}
                   onChange={(v) => set("dispatch", { projectIds: v })}
                   empty="（先连接 Redmine）"
